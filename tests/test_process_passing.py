@@ -32,3 +32,6 @@ def test_pipe_in_process() -> None:
     with ProcessPoolExecutor() as ppe:
         assert ppe.submit(pipe).result() == 13
         assert global_var == 0
+
+
+# test_pipe_in_process()
