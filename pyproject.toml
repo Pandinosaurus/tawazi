@@ -28,7 +28,9 @@ dev = [
     "matplotlib>=3.5.3",
     "pytest>=7.1.2",
     "pytest-cov>=4.0.0",
-    "pytest-codeblocks"
+    "pytest-codeblocks",
+    "multiprocessing_on_dill",
+    "pathos"
 ]
 
 doc = [
@@ -56,7 +58,7 @@ strict_equality = true
 # --strict end
 
 [[tool.mypy.overrides]]
-module = "matplotlib.*,networkx.*,yaml.*"
+module = "matplotlib.*,networkx.*,yaml.*,multiprocessing_on_dill.*,pathos.*"
 ignore_missing_imports = true
 
 [tool.black]
