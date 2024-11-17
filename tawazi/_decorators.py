@@ -3,23 +3,16 @@
 The user should use the decorators `@dag` and `@xn` to create Tawazi objects `DAG` and `ExecNode`.
 """
 import functools
-from typing import Any, Callable, List, Optional, Union, overload
+from typing import Any, Callable, Optional, Union, overload
 
-from tawazi._dag import DAG
-from tawazi._helpers import get_args_and_default_args
-from tawazi.errors import ErrorStrategy
+from typing_extensions import Literal
+
+from tawazi import AsyncDAG
+from tawazi._dag import DAG, threadsafe_make_dag
 
 from .config import cfg
 from .consts import RVDAG, RVXN, P, Resource, TagOrTags
-from .node import (
-    ArgExecNode,
-    ExecNode,
-    LazyExecNode,
-    ReturnUXNsType,
-    UsageExecNode,
-    node,
-    wrap_in_uxns,
-)
+from .node import LazyExecNode
 
 
 @overload
@@ -91,9 +84,10 @@ def xn(
             NOTE setup nodes are currently not threadsafe!
                 because they are shared between all threads!
                 If you execute the same pipeline in multiple threads during the setup phase, the behavior is undefined.
-                This is why it is best to invoke the DAG.setup method before using the DAG in a multithreaded environment.
+                It is best to invoke the DAG.setup method before using the DAG in a multithreaded environment.
                 This problem will be resolved in the future
-        unpack_to (Optional[int]): if not None, this ExecNode's execution must return unpacked results corresponding to the given value
+        unpack_to (Optional[int]): if not None, this ExecNode's execution must return unpacked results corresponding
+                                   to the given value
         resource (str): the resource to use to execute this ExecNode. Defaults to "thread".
 
     Returns:
@@ -104,8 +98,15 @@ def xn(
     """
 
     def intermediate_wrapper(_func: Callable[P, RVXN]) -> LazyExecNode[P, RVXN]:
-        lazy_exec_node = LazyExecNode(
-            _func, priority, is_sequential, debug, tag, setup, unpack_to, resource
+        lazy_exec_node: LazyExecNode[P, RVXN] = LazyExecNode(
+            exec_function=_func,
+            priority=priority,
+            is_sequential=is_sequential,
+            debug=debug,
+            tag=tag,
+            setup=setup,
+            unpack_to=unpack_to,
+            resource=resource,
         )
         functools.update_wrapper(lazy_exec_node, _func)
         return lazy_exec_node
@@ -129,15 +130,49 @@ def dag(
     declare_dag_function: Callable[P, RVDAG],
     *,
     max_concurrency: int = 1,
-    behavior: ErrorStrategy = ErrorStrategy.strict,
+    is_async: Literal[False] = False,
 ) -> DAG[P, RVDAG]:
     ...
 
 
 @overload
 def dag(
-    *, max_concurrency: int = 1, behavior: ErrorStrategy = ErrorStrategy.strict
+    declare_dag_function: Callable[P, RVDAG],
+    *,
+    max_concurrency: int = 1,
+    is_async: Literal[True] = True,
+) -> AsyncDAG[P, RVDAG]:
+    ...
+
+
+@overload
+def dag(
+    declare_dag_function: Callable[P, RVDAG], *, max_concurrency: int = 1, is_async: bool = False
+) -> Union[DAG[P, RVDAG], AsyncDAG[P, RVDAG]]:
+    ...
+
+
+@overload
+def dag(
+    *, max_concurrency: int = 1, is_async: Literal[False] = False
 ) -> Callable[[Callable[P, RVDAG]], DAG[P, RVDAG]]:
+    ...
+
+
+@overload
+def dag(
+    *, max_concurrency: int = 1, is_async: Literal[True] = True
+) -> Callable[[Callable[P, RVDAG]], AsyncDAG[P, RVDAG]]:
+    ...
+
+
+@overload
+def dag(
+    *, max_concurrency: int = 1, is_async: bool = False
+) -> Union[
+    Callable[[Callable[P, RVDAG]], DAG[P, RVDAG]],
+    Callable[[Callable[P, RVDAG]], AsyncDAG[P, RVDAG]],
+]:
     ...
 
 
@@ -145,8 +180,12 @@ def dag(
     declare_dag_function: Optional[Callable[P, RVDAG]] = None,
     *,
     max_concurrency: int = 1,
-    behavior: ErrorStrategy = ErrorStrategy.strict,
-) -> Union[Callable[[Callable[P, RVDAG]], DAG[P, RVDAG]], DAG[P, RVDAG]]:
+    is_async: bool = False,
+) -> Union[
+    DAG[P, RVDAG],
+    AsyncDAG[P, RVDAG],
+    Callable[[Callable[P, RVDAG]], Union[DAG[P, RVDAG], AsyncDAG[P, RVDAG]]],
+]:
     """Transform the declared `ExecNode`s into a DAG that can be executed by Tawazi's scheduler.
 
     The same DAG can be executed multiple times.
@@ -162,66 +201,19 @@ def dag(
             However, you can use some simple python code to generate constants.
             These constants are computed only once during the `DAG` declaration.
         max_concurrency: the maximum number of concurrent threads to execute in parallel.
-        behavior: the behavior of the `DAG` when an error occurs during the execution of a function (`ExecNode`).
+        is_async: if True, the returned object will be an `AsyncDAG` instead of a `DAG`.
 
     Returns:
-        a `DAG` instance that can be used just like a normal Python function. However it will be executed by Tawazi's scheduler.
+        a `DAG` instance that can be used just like a normal Python function. It will be executed by Tawazi's scheduler.
 
     Raises:
         TypeError: If the decorated object is not a Callable.
     """
 
     # wrapper used to support parametrized and non parametrized decorators
-    def intermediate_wrapper(_func: Callable[P, RVDAG]) -> DAG[P, RVDAG]:
+    def intermediate_wrapper(_func: Callable[P, RVDAG]) -> Union[DAG[P, RVDAG], AsyncDAG[P, RVDAG]]:
         # 0. Protect against multiple threads declaring many DAGs at the same time
-        with node.exec_nodes_lock:
-            # 1. node.exec_nodes contains all the ExecNodes that concern the DAG being built at the moment.
-            #      make sure it is empty
-            node.exec_nodes = {}
-            try:
-                # 2. make ExecNodes corresponding to the arguments of the ExecNode
-                # 2.1 get the names of the arguments and the default values
-                func_args, func_default_args = get_args_and_default_args(_func)
-
-                # 2.2 Construct non default arguments.
-                # Corresponding values must be provided during usage
-                args: List[ExecNode] = [ArgExecNode(_func, arg_name) for arg_name in func_args]
-                # 2.2 Construct Default arguments.
-                args.extend(
-                    [
-                        ArgExecNode(_func, arg_name, arg)
-                        for arg_name, arg in func_default_args.items()
-                    ]
-                )
-                # 2.3 Arguments are also ExecNodes that get executed inside the scheduler
-                node.exec_nodes.update({xn.id: xn for xn in args})
-                # 2.4 make UsageExecNodes for input arguments
-                uxn_args = [UsageExecNode(xn.id) for xn in args]
-
-                # 3. Execute the dependency describer function
-                # NOTE: Only ordered parameters are supported at the moment!
-                #  No **kwargs!! Only positional Arguments
-                # used to be fetch the results at the end of the computation
-                returned_val: Any = _func(*uxn_args)  # type: ignore[arg-type]
-
-                returned_usage_exec_nodes: ReturnUXNsType = wrap_in_uxns(_func, returned_val)
-
-                # 4. Construct the DAG instance
-                d: DAG[P, RVDAG] = DAG(
-                    node.exec_nodes,
-                    input_uxns=uxn_args,
-                    return_uxns=returned_usage_exec_nodes,
-                    max_concurrency=max_concurrency,
-                    behavior=behavior,
-                )
-
-            # clean up even in case an error is raised during dag construction
-            finally:
-                # 5. Clean global variable
-                # node.exec_nodes are deep copied inside the DAG.
-                #   we can empty the global variable node.exec_nodes
-                node.exec_nodes = {}
-
+        d = threadsafe_make_dag(_func, max_concurrency, is_async)
         functools.update_wrapper(d, _func)
         return d
 

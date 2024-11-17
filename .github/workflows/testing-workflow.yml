@@ -5,9 +5,9 @@ name: Test Workflow
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "v0.3/main" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "v0.3/main" ]
   workflow_dispatch:
 
 concurrency:
@@ -26,25 +26,26 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python_version: ["3.7", "3.8", "3.9", "3.10", "3.11"]
+        python_version: ["3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python_version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python_version }}
 
-    - uses: actions/setup-python@v4
+    - uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python_version }}
         cache-dependency-path: pyproject.toml
 
     - name: Install dependencies
+      # Installs pydantic v2
       run: |
         set -o pipefail
-        pip install pip==22.2.2
-        pip install flit wheel
+        sudo apt install -y graphviz
+        pip install pip flit wheel --upgrade
         flit install -s --deps develop
 
     - name: Test documentation
@@ -58,4 +59,11 @@ jobs:
     - name: Run tests
       run: |
         set -o pipefail
-        pytest --doctest-modules tests/ | tee pytest-coverage.txt
+        pytest --doctest-modules tests/ tawazi | tee pytest-coverage.txt
+
+    # TODO: remove when pydantic v1 is dropped
+    - name: Tests with Pydantic v1
+      run: |
+        set -o pipefail
+        flit install -s --deps develop --extras pydantic1
+        pytest --doctest-modules tests/ tawazi

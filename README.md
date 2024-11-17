@@ -1,6 +1,6 @@
 # tawazi
 <!--Python badges -->
-[![Python 3.7](https://img.shields.io/badge/python-3.7%20|%203.8%20|%203.9%20|%203.10%20|%203.11-blue.svg)](https://www.python.org/)
+[![Python 3.7](https://img.shields.io/badge/python-3.7%20|%203.8%20|%203.9%20|%203.10%20|%203.11%20|%203.12|%203.13-blue.svg)](https://www.python.org/)
 [![Checked with mypy](http://www.mypy-lang.org/static/mypy_badge.svg)](http://mypy-lang.org/)
 [![CodeFactor](https://www.codefactor.io/repository/github/mindee/tawazi/badge)](https://www.codefactor.io/repository/github/mindee/tawazi)
 [![Downloads](https://img.shields.io/pypi/dm/tawazi)](https://pypi.org/project/tawazi/)
@@ -11,6 +11,8 @@
 ## Introduction
 
 <!-- TODO: put a link explaining what a DAG is-->
+
+<!-- TODO: document that if you want to run DAG in a sync context, the DAG should be sync, if you want to run it in a async context, the DAG should be async-->
 
 [Tawazi](https://pypi.org/project/tawazi/) facilitates **parallel** execution of functions using a [DAG](https://en.wikipedia.org/wiki/Directed_acyclic_graph) dependency structure.
 
@@ -138,7 +140,7 @@ pip install --upgrade pip
 pip install flit wheel
 
 cd tawazi
-flit install -s
+flit install -s --deps develop
 ```
 
 ## Future developments

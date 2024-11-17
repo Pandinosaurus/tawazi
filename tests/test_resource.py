@@ -3,6 +3,7 @@ from time import sleep, time
 from typing import Tuple
 
 from tawazi import Resource, dag, xn
+from typing_extensions import Literal
 
 T = 0.1
 
@@ -63,3 +64,15 @@ def test_main_thread_sequential_exec_node() -> None:
         return xn1()
 
     assert pipe() == 1
+
+
+def test_async_threaded_in_sync() -> None:
+    @xn(resource=Resource.async_thread)
+    def async_threaded_xn() -> Literal["async_threaded"]:
+        return "async_threaded"
+
+    @dag
+    def pipeline() -> Literal["async_threaded"]:
+        return async_threaded_xn()
+
+    assert pipeline() == "async_threaded"

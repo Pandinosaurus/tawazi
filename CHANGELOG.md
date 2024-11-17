@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+## v0.5.2 (2024-11-12)
+
+### Bug Fixes
+* :bug: typing with py310 Union |
+
+## v0.5.1 (2024-10-31)
+
+### Changes
+* :heavy_minus_sign: compatible with pydantic v1 and v2
+
+## v0.5.0 (2024-10-28)
+
+### Breaking Changes
+* :sparkles: draw a DAG using graphviz
+* :boom: change TawaziBaseException to TawaziError
+
+### Bug Fixes
+* :bug: inherit from Exception instead of BaseException
+
+## v0.4.1 (2024-09-11)
+
+### Improvements
+* :recycle: use dynamic node construction instead of static one
+
+## v0.4.0 (2024-08-09)
+
+### Improvements
+* :recycle: big overhaul to the dag interface
+* :recycle: rely on networkx for most of the graph-related computations
+* :sparkles: root nodes implementation (see documentation for further explanation)
+* :memo: improve documentation and remove most of the outdated comments
+* :sparkles: added AsyncDAG / AsyncDAGExecution to execute DAG in async context
+* :sparkles: added Async-Threaded resource
+* :sparkles: added feature of running DAG in DAG
+* :sparkles: Include Line Number pointing to the location where the DAG made the error!
+* :sparkles: Support Ellipsis for DAG.compose' input
+* :zap: Optimize ArgExecNode and ReturnExecNode by using main-thread instead of DEFAULT_THREAD
+
+### Bug Fixes
+* :bug: fix twz_active behavior. If twz_active is False, the node returns None
+
+## v0.3.4 (2024-03-14)
+
+### Bug Fixes
+* :bug: failing Tuple typing check with future annotations
+
+## v0.3.3 (2024-02-26)
+
+### Improvements
+* :zap: accelerate getting highest priority node (optimizations)
+* :zap: accelerate get_num_running_threads
+* :zap: accelerate node removal by using BiDirectionalDict
+* :zap: accelerate node removal
+* :zap: accelerate get_num_running_threads by using len(running) instead
+
+### Bug Fixes
+* :bug: logging
+
+## v0.3.2 (2024-01-04)
+
+### Bug Fixes
+* :bug: wrong error message
+* :bug: fix counting nodes during dag description
+* :bug: failing to run DAG inside a Process
+
+### Improvements
+* :zap: faster logging
+* :recycle: better mypy on raise_arg_error
+* :white_check_mark: test execnode with typed tuple
+* :white_check_mark: test passing DAG inside a Process
+
 ## v0.3.1 (2023-07-18)
 
 ### Bug Fixes

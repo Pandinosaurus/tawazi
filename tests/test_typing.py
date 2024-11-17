@@ -1,11 +1,7 @@
-# this is a file that describes using Tawazi without being protected from mypy!
-# it is tested during the formatting process.
-
 from typing import Tuple
 
 import pytest
-from tawazi import dag, xn
-from tawazi.errors import ErrorStrategy
+from tawazi import AsyncDAG, dag, xn
 
 
 @xn
@@ -51,7 +47,7 @@ def pipe(input: int) -> Tuple[int, str]:
     return tt
 
 
-@dag(behavior=ErrorStrategy.strict)
+@dag
 def pipe_configured(input: int) -> Tuple[int, str]:
     _none = function_no_parameter()
     _none = function_with_parameter(1234)
@@ -70,12 +66,20 @@ def test_mypy_() -> None:
     with pytest.raises(TypeError):
         pipe(1, "str", "fjdkslajfld", "hi")  # type: ignore[call-arg]
 
-    # TODO: use assignements with typing for _var!
     _res = pipe(1)
     _res = pipe("1")  # type: ignore[arg-type]
-    pipe.node_dict  # noqa: B018
+    _ = pipe.exec_nodes  # noqa: B018
     pipe.setup()
 
-    exec = pipe.executor()
+    _exec = pipe.executor()
+    _exec.dag(1234)
 
-    exec.dag(1234)
+
+def test_typing_async() -> None:
+    @dag(is_async=True)
+    def my_async_dag() -> None:
+        pass
+
+    # assert that mypy passes this test
+    var: AsyncDAG[[], None] = my_async_dag
+    assert isinstance(var, AsyncDAG)

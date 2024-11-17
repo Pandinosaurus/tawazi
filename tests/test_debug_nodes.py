@@ -1,20 +1,19 @@
-from typing import Any, List, TypeVar
+from logging import Logger
+from typing import Any, List
 
 import pytest
 from tawazi import dag, xn
-from tawazi.errors import TawaziBaseException
+from tawazi.errors import TawaziError
+
+from .common import stub
+
+logger = Logger(name="mylogger", level="ERROR")
+
 
 my_len_has_ran = False
 is_positive_len_has_ran = False
 print_share_var = None
 inc_shared_var = 0
-
-T = TypeVar("T")
-
-
-@xn
-def stub(img: T) -> T:
-    return img
 
 
 @xn(debug=True)
@@ -30,9 +29,9 @@ def is_positive_len(len_img: int) -> None:
     global is_positive_len_has_ran
     # this node depends of the my_len!
     if len_img > 0:
-        print("positive")  # noqa: T201
+        logger.debug("positive")
     else:
-        print("negative")  # noqa: T201
+        logger.debug("negative")
 
     is_positive_len_has_ran = True
 
@@ -92,7 +91,7 @@ def test_interdependant_debug_nodes() -> None:
 
 
 def test_wrongly_defined_pipeline() -> None:
-    with pytest.raises(TawaziBaseException):
+    with pytest.raises(TawaziError):
 
         @dag
         def pipeline(img: List[Any]) -> int:

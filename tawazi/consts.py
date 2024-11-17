@@ -10,8 +10,8 @@ ARG_NAME_UNPACK_TO = "twz_unpack_to"
 RESERVED_KWARGS = ARG_NAME_TAG, ARG_NAME_ACTIVATE, ARG_NAME_UNPACK_TO
 
 # TODO: check for possible collisions
-ARG_NAME_SEP = ">>>"
-RETURN_NAME_SEP = "<<<"
+ARG_NAME_SEP = ">!>"
+RETURN_NAME_SEP = "<!<"
 USE_SEP_START = "<<"
 USE_SEP_END = ">>"
 
@@ -32,6 +32,9 @@ class NoValType:
     >>> assert NoVal1 is deepcopy(NoVal1)
     >>> assert NoVal1 is copy(NoVal1)
     >>> assert NoVal1 != NoVal1
+    >>> assert bool(NoVal1) is False
+    >>> assert repr(NoVal1) == "NoVal"
+    >>> assert hash(NoVal1) == id(NoVal1)
     """
 
     _instance = None
@@ -92,6 +95,10 @@ class NoValType:
         """
         return self
 
+    def __hash__(self) -> int:
+        """Implement hash method in order to make object immutable like."""
+        return id(self)
+
 
 NoVal = NoValType()
 
@@ -99,7 +106,7 @@ NoVal = NoValType()
 
 Identifier = str
 Tag = str  # anything immutable but not a sequence
-TagOrTags = Union[Tag, Tuple[Tag]]  # a sequence of tags
+TagOrTags = Union[Tag, Tuple[Tag, ...]]  # a sequence of tags
 
 RVTypes = Union[Any, Tuple[Any, ...], List[Any], Dict[str, Any]]
 P = ParamSpec("P")
@@ -112,18 +119,22 @@ RVXN = TypeVar("RVXN", covariant=True)
 class Resource(str, Enum):
     """The Resource to use launching ExecNodes inside the DAG scheduler a DAG.
 
+    ```md
     Resource can be either:
-    1. "thread": Launch the ExecNode in a thread (Default)
-    2. "main-thread": Launch the ExecNode inside the main thread, directly inside the main scheduler.
+    1. "main-thread": Launch the ExecNode inside the main thread, directly inside the main scheduler.
+    2. "thread": Launch the ExecNode in a thread (Default)
+    3. "async-thread": Launch the ExecNode in an async thread and await it
 
     Notice that when "main-thread" is used, some of the scheduler functionalities stop working as previously expected:
     1. No new ExecNode will be launched during the execution of the corresponding ExecNode
     2. If timeout is set on the corresponding ExecNode, it is not guaranteed to work properly.
+    ```
     """
 
     # supported behavior following a raised error
-    thread: str = "thread"
     main_thread: str = "main-thread"
+    thread: str = "thread"
+    async_thread: str = "async-thread"
     # process: str = "process"  # Reserved for the future
     # sub_interpreter: str = "sub-interpreter"  # Reserved for the future
 

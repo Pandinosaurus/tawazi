@@ -4,9 +4,9 @@
 ::: tawazi.or_
 ::: tawazi.not_
 
-::: tawazi.ErrorStrategy
 ::: tawazi.Resource
     options:
         members:
-            - thread
-            - main
+        - main_thread
+        - thread
+        - async_thread

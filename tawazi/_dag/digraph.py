@@ -1,24 +1,150 @@
 """Module containing the definition of a Directed Graph Extension of networkx.DiGraph."""
+from collections import defaultdict
 from copy import deepcopy
-from typing import Iterable, List, Optional, Set, Tuple
+from itertools import chain
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import networkx as nx
-from loguru import logger
-from networkx import NetworkXNoCycle, find_cycle
+from networkx import NetworkXNoCycle, NetworkXUnfeasible, find_cycle
+from typing_extensions import Self
 
-from tawazi.consts import Identifier
+from tawazi.config import Config
+from tawazi.consts import Identifier, Tag
+from tawazi.errors import TawaziUsageError
+from tawazi.node import ExecNode, UsageExecNode
 
 
 class DiGraphEx(nx.DiGraph):
     """Extends the DiGraph with some methods."""
 
-    def root_nodes(self) -> List[Identifier]:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+        # Access to nodes data is very slow, using dict is faster
+        self.tag: Dict[Identifier, Optional[List[Tag]]] = defaultdict(lambda: None)
+        self.debug: Dict[Identifier, bool] = defaultdict(lambda: False)
+        self.setup: Dict[Identifier, bool] = defaultdict(lambda: False)
+        self.compound_priority: Dict[Identifier, int] = defaultdict(lambda: 0)
+
+    @classmethod
+    def from_exec_nodes(
+        cls, input_nodes: List[UsageExecNode], exec_nodes: Dict[Identifier, ExecNode]
+    ) -> Self:
+        """Build a DigraphEx from exec nodes.
+
+        Args:
+            input_nodes: nodes that are the inputs of the graph
+            exec_nodes: the graph nodes
+
+        Returns:
+            the DigraphEx object
+        """
+        graph = DiGraphEx()
+
+        input_ids = [uxn.id for uxn in input_nodes]
+        for node in exec_nodes.values():
+            # add node and edges
+            graph.add_exec_node(node)
+
+            # add tag, debug, setup and priority
+            if node.tag:
+                if isinstance(node.tag, Tag):
+                    graph.tag[node.id] = [node.tag]
+                else:
+                    graph.tag[node.id] = [t for t in node.tag]
+
+            graph.debug[node.id] = node.debug
+            graph.setup[node.id] = node.setup
+            graph.compound_priority[node.id] = node.priority
+
+            # validate setup ExecNodes
+            if node.setup and any(dep.id in input_ids for dep in node.dependencies):
+                raise TawaziUsageError(
+                    f"The ExecNode {node} takes as parameters one of the DAG's input parameter"
+                )
+
+        # check for circular dependencies
+        try:
+            cycle = find_cycle(graph)
+            raise NetworkXUnfeasible(f"the DAG contains at least a circular dependency: {cycle}")
+        except NetworkXNoCycle:
+            pass
+
+        # compute the sum of priorities of all recursive children
+        graph.assign_compound_priority()
+
+        return graph
+
+    def add_exec_node(self, xn: ExecNode) -> None:
+        """Add an ExecNode and its dependencies to the graph."""
+        self.add_node(xn.id)
+        self.add_edges_from([(dep.id, xn.id) for dep in xn.dependencies])
+
+    def make_subgraph(
+        self,
+        target_nodes: Optional[List[str]] = None,
+        exclude_nodes: Optional[List[str]] = None,
+        root_nodes: Optional[List[str]] = None,
+    ) -> Self:
+        """Builds the DigraphEx, with potential graph pruning.
+
+        Args:
+            target_nodes: nodes that we want to run and their dependencies
+            exclude_nodes: nodes that should be excluded from the graph
+            root_nodes: base ancestor nodes from which to start graph resolution
+
+        Returns:
+            Base Graph that will be used for the computations
+        """
+        graph = deepcopy(self)
+
+        # first try to heavily prune removing roots
+        if root_nodes is not None:
+            if not set(root_nodes).issubset(set(graph.root_nodes)):
+                raise ValueError(
+                    f"nodes {set(graph.root_nodes).difference(set(root_nodes))} aren't root nodes."
+                )
+
+            # extract subgraph with only provided roots
+            # NOTE: copy is because edges/nodes are shared with original graph
+            graph = graph.subgraph(graph.multiple_nodes_successors(root_nodes)).copy()
+
+        # then exclude nodes
+        if exclude_nodes is not None:
+            graph.remove_nodes_from(graph.multiple_nodes_successors(exclude_nodes))
+
+        # lastly select additional nodes
+        if target_nodes is not None:
+            graph = graph.minimal_induced_subgraph(target_nodes).copy()
+
+        return graph
+
+    @property
+    def root_nodes(self) -> Set[Identifier]:
         """Safely gets the root nodes.
 
         Returns:
             List of root nodes
         """
-        return [node for node, degree in self.in_degree if degree == 0]
+        return {node for node, degree in self.in_degree if degree == 0}
+
+    def remove_root_node(self, root_node: Identifier) -> Set[Identifier]:
+        """Removes a root node and returns all the new root nodes generated by this modification to the DAG."""
+        generated_root_nodes = {
+            new_root_node
+            for new_root_node in self.successors(root_node)
+            if self.in_degree[new_root_node] == 1
+        }
+        self.remove_node(root_node)
+        return generated_root_nodes
+
+    def remove_any_root_node(self) -> Identifier:
+        """Removes any root node and returns the removed root node."""
+        for node, degree in self.in_degree:
+            if degree == 0:
+                self.remove_node(node)
+                return node  # type: ignore[no-any-return]
+        raise ValueError("No root node to remove.")
 
     @property
     def leaf_nodes(self) -> List[Identifier]:
@@ -29,6 +155,75 @@ class DiGraphEx(nx.DiGraph):
         """
         return [node for node, degree in self.out_degree if degree == 0]
 
+    @property
+    def debug_nodes(self) -> List[Identifier]:
+        """Get the debug nodes.
+
+        Returns:
+            the debug nodes
+        """
+        return [id_ for id_, debug in self.debug.items() if debug]
+
+    @property
+    def setup_nodes(self) -> List[Identifier]:
+        """Get the setup nodes.
+
+        Returns:
+            the setup nodes
+        """
+        return [id_ for id_, setup in self.setup.items() if setup]
+
+    @property
+    def tags(self) -> Set[str]:
+        """Get all the tags available for the graph.
+
+        Returns:
+            A set of tags
+        """
+        return set(chain(*(tags for tags in self.tag.values())))  # type: ignore[arg-type]
+
+    @property
+    def topologically_sorted(self) -> List[Identifier]:
+        """Makes the simple topological sort of the graph nodes.
+
+        Returns:
+            List of nodes of the graph listed in topological order
+        """
+        return list(nx.topological_sort(self))
+
+    def get_tagged_nodes(self, tag: Tag) -> List[str]:
+        """Get nodes with a certain tag.
+
+        Args:
+            tag: the tag identifier
+
+        Returns:
+            a list of nodes
+        """
+        return [xn for xn, tags in self.tag.items() if tags is not None and tag in tags]
+
+    def single_node_successors(self, node_id: Identifier) -> List[Identifier]:
+        """Get all the successors of a node with a depth first search.
+
+        Args:
+            node_id: the node acting as the root of the search
+
+        Returns:
+            list of the node's successors
+        """
+        return list(nx.dfs_tree(self, node_id).nodes())
+
+    def multiple_nodes_successors(self, nodes_ids: Sequence[Identifier]) -> Set[Identifier]:
+        """Get the successors of all nodes in the iterable.
+
+        Args:
+            nodes_ids: nodes of which we want successors
+
+        Returns:
+            a set of all the sucessors
+        """
+        return set(list(chain(*[self.single_node_successors(node_id) for node_id in nodes_ids])))
+
     def remove_recursively(self, root_node: Identifier, remove_root_node: bool = True) -> None:
         """Recursively removes all the nodes that depend on the provided.
 
@@ -36,17 +231,7 @@ class DiGraphEx(nx.DiGraph):
             root_node (Identifier): the root node
             remove_root_node (bool, optional): whether to remove the root node or not. Defaults to True.
         """
-        nodes_to_remove: Set[Identifier] = set()
-
-        def dfs(n: Identifier, graph: DiGraphEx, visited: Set[Identifier]) -> None:
-            if n in visited:
-                return
-
-            visited.add(n)
-            for child in graph[n].keys():
-                dfs(child, graph, visited)
-
-        dfs(root_node, self, nodes_to_remove)
+        nodes_to_remove = self.single_node_successors(root_node)
 
         # skip removing the root node if requested
         if not remove_root_node:
@@ -55,12 +240,72 @@ class DiGraphEx(nx.DiGraph):
         for node in nodes_to_remove:
             self.remove_node(node)
 
-    def subgraph_leaves(self, nodes: List[Identifier]) -> Set[Identifier]:
-        """Modifies the graph to become a subgraph.
+    def include_debug_nodes(self, leaves_ids: List[Identifier]) -> List[Identifier]:
+        """Get debug nodes that are runnable with provided nodes as direct roots.
+
+        For example:
+        A
+        |
+        B
+        | \
+        D E
+
+        if D is not a debug ExecNode and E is a debug ExecNode.
+        If the subgraph whose leaf ExecNode D is executed,
+        E should also be included in the execution because it can be executed (debug node whose inputs are provided)
+        Hence we should extend the subgraph containing only D to also contain E
+
+        Args:
+            leaves_ids: the leaves ids of the subgraph
+
+        Returns:
+            the leaves ids of the new extended subgraph that contains more debug ExecNodes
+        """
+        new_debug_xn_discovered = True
+        while new_debug_xn_discovered:
+            new_debug_xn_discovered = False
+            for id_ in leaves_ids:
+                for successor_id in self.successors(id_):
+                    if successor_id not in leaves_ids and successor_id in self.debug_nodes:
+                        # a new debug XN has been discovered!
+                        if set(self.predecessors(successor_id)).issubset(set(leaves_ids)):
+                            new_debug_xn_discovered = True
+                            # this new XN can run by only running the current leaves_ids
+                            leaves_ids.append(successor_id)
+        return leaves_ids
+
+    def extend_graph_with_debug_nodes(self, original_graph: Self, cfg: Config) -> Self:
+        """Add or remove debug nodes depending on the configuration.
+
+        Args:
+            original_graph: the graph containing a broader set of nodes
+            cfg: the tawazi configuration
+
+        Returns:
+            the correct subgraph
+        """
+        if cfg.RUN_DEBUG_NODES:
+            nodes_to_include = original_graph.include_debug_nodes(self.leaf_nodes) + list(
+                self.nodes
+            )
+        else:
+            nodes_to_include = list(set(self.nodes) - set(self.debug_nodes))
+
+        # TODO: optimize this part by avoiding the copy of the graph which costing 40ms for findoc currently
+        #  it can be done by reconstructing the graph instead of destroying it in the scheduler
+        # networkx typing problem
+        new_graph = original_graph.subgraph(nodes_to_include).copy()
+        new_graph.tag = self.tag
+        new_graph.debug = self.debug
+        new_graph.setup = self.setup
+        new_graph.compound_priority = self.compound_priority
+        return new_graph  # type: ignore[no-any-return]
+
+    def minimal_induced_subgraph(self, nodes: List[Identifier]) -> Self:
+        """Get the minimal induced subgraph containing the provided nodes.
 
         The generated subgraph contains the provided nodes as leaf nodes.
         For example:
-        TODO: use the future print to test this function!
         graph =
         "
         A
@@ -83,19 +328,11 @@ class DiGraphEx(nx.DiGraph):
             nodes: the list of nodes to be executed
 
         Returns:
-            the nodes that are provided but can never become leaf nodes:
-                NOTE Impossible cases are handled using a best effort approach;
-                For example, if a node and its children are provided,
-                all those nodes will be left in the subgraph. However,
-                a warning will be issued
+            the induced subgraph over the original graph with the provided nodes:
 
         Raises:
             ValueError: if the provided nodes are not in the graph
         """
-        # works by pruning the graph until all leaf nodes
-        # are contained inside the provided "nodes"
-        # in the arguments of this method
-
         if any([node not in self.nodes for node in nodes]):
             raise ValueError(
                 f"The provided nodes are not in the graph. "
@@ -103,45 +340,10 @@ class DiGraphEx(nx.DiGraph):
                 f"The graph only contains: {self.nodes}."
             )
 
-        nodes_to_remove = set(self.leaf_nodes).difference(set(nodes))
-
-        while nodes_to_remove:
-            node_to_remove = nodes_to_remove.pop()
-            self.remove_node(node_to_remove)
-
-            nodes_to_remove = set(self.leaf_nodes).difference(set(nodes))
-
-        unremovable_nodes = set(nodes).difference(set(self.leaf_nodes))
-
-        if len(unremovable_nodes) > 0:
-            logger.debug(
-                f"The provided nodes contain more nodes than necessary, "
-                f"please remove {unremovable_nodes} nodes"
-            )
-
-        return unremovable_nodes
-
-    @property
-    def topologically_sorted(self) -> List[Identifier]:
-        """Makes the simple topological sort of the graph nodes.
-
-        Returns:
-            List of nodes of the graph listed in topological order
-        """
-        return list(nx.topological_sort(self))
-
-    def _find_cycle(self) -> Optional[List[Tuple[Identifier, Identifier]]]:
-        """Finds the cycles in the DAG. A DAG shouldn't have any dependency cycle.
-
-        Returns:
-            A list of the edges responsible for the cycles in case there are some (in forward and backward),
-                otherwise nothing. (e.g. [('taxes', 'amount_reconciliation'),('amount_reconciliation', 'taxes')])
-        """
-        try:
-            cycle: List[Tuple[Identifier, Identifier]] = find_cycle(self)
-            return cycle
-        except NetworkXNoCycle:
-            return None
+        # compute all the ancestor nodes that will be included in the graph
+        all_ancestors = self.ancestors_of_iter(nodes)
+        induced_subgraph: DiGraphEx = nx.induced_subgraph(self, all_ancestors | set(nodes))
+        return induced_subgraph
 
     def ancestors_of_iter(self, nodes: Iterable[Identifier]) -> Set[Identifier]:
         """Returns the ancestors of the provided nodes.
@@ -152,29 +354,29 @@ class DiGraphEx(nx.DiGraph):
         Returns:
             Set[Identifier]: The ancestors of the provided nodes
         """
-        ancestors = set()
-        for node in nodes:
-            ancestors.update(nx.ancestors(self, node))
-        return ancestors
+        return set().union(*chain(nx.ancestors(G=self, source=node) for node in nodes))
 
+    def assign_compound_priority(self) -> None:
+        """Assigns a compound priority to all nodes in the graph.
 
-def subgraph(graph: DiGraphEx, leaves_ids: Optional[List[Identifier]]) -> DiGraphEx:
-    """Deep copy the same graph if leaves_ids is None, otherwise returns a new graph by applying `graph.subgraph_leaves`.
+        The compound priority is the sum of the priorities of all children recursively.
+        """
+        # 1. start from bottom up
+        leaf_ids = set(self.leaf_nodes)
 
-    Args:
-        graph (DiGraphEx): graph describing the DAG
-        leaves_ids (List[Identifier]): The leaves that must be executed
+        # 2. assign the compound priority for all the remaining nodes in the graph:
+        # Priority assignment happens by epochs:
+        # 2.1. during every epoch, we assign the compound priority for the parents of the current leaf nodes
 
-    Returns:
-        DiGraphEx: The subgraph of the provided graph
-    """
-    # TODO: avoid mutable state, hence avoid doing deep copies ?
-    # 0. deep copy the graph ids because it will be pruned during calculation
-    graph = deepcopy(graph)
+        while leaf_ids:
+            next_leaf_ids = set()
+            for leaf_id in leaf_ids:
+                compound_priority = self.compound_priority[leaf_id]
 
-    # TODO: make the creation of subgraph possible directly from initialization
-    # 1. create the subgraph
-    if leaves_ids is not None:
-        graph.subgraph_leaves(leaves_ids)
+                # for parent nodes, this loop won't execute
+                for parent_id in self.predecessors(leaf_id):
+                    # increment the compound_priority of the parent node by the leaf priority
+                    self.compound_priority[parent_id] += compound_priority
 
-    return graph
+                    next_leaf_ids.add(parent_id)
+            leaf_ids = next_leaf_ids

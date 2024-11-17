@@ -1,121 +1,151 @@
 """module containing DAG and DAGExecution which are the containers that run ExecNodes in Tawazi."""
 import json
 import pickle
-import time
 import warnings
-from collections import defaultdict
-from copy import copy, deepcopy
+from collections import Counter
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from itertools import chain
 from pathlib import Path
-from typing import Any, Dict, Generic, List, NoReturn, Optional, Sequence, Set, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import networkx as nx
 import yaml
 from loguru import logger
-from networkx.exception import NetworkXUnfeasible
 
-from tawazi._helpers import _make_raise_arg_error, _UniqueKeyLoader
+from tawazi import consts
+from tawazi._helpers import StrictDict, UniqueKeyLoader
 from tawazi.config import cfg
-from tawazi.consts import RVDAG, Identifier, NoVal, P, RVTypes, Tag
-from tawazi.errors import ErrorStrategy, TawaziTypeError, TawaziUsageError
-from tawazi.node import Alias, ArgExecNode, ExecNode, ReturnUXNsType, UsageExecNode
+from tawazi.consts import ARG_NAME_ACTIVATE, RVDAG, Identifier, P, Tag
+from tawazi.errors import TawaziTypeError, TawaziUsageError
+from tawazi.node import Alias, ArgExecNode, ExecNode, ReturnUXNsType, UsageExecNode, node
+from tawazi.node.node import LazyExecNode, make_active, make_axn_id
+from tawazi.profile import Profile
 
 from .digraph import DiGraphEx
-from .helpers import copy_non_setup_xns, execute
+from .helpers import async_execute, extend_results_with_args, get_return_values, sync_execute
 
 
-class DAG(Generic[P, RVDAG]):
+def construct_subdag_arg_uxns(
+    *args: Iterable[Union[UsageExecNode, Any]], to_subdag_id: Callable[[str], str], qualname: str
+) -> List[UsageExecNode]:
+    """Construct UsageExecNodes from the arguments passed to a subdag."""
+    # Construct default arguments
+    uxns: List[UsageExecNode] = []
+    for i, arg in enumerate(args):
+        # arg is a default value
+        if not isinstance(arg, UsageExecNode):
+            axn = ArgExecNode(make_axn_id(to_subdag_id(qualname), i))
+            node.exec_nodes[axn.id] = axn
+            node.results[axn.id] = arg
+            uxn = UsageExecNode(axn.id)
+        else:
+            uxn = arg
+        uxns.append(uxn)
+    return uxns
+
+
+def detect_duplicates(expanded_config: List[Tuple[Identifier, Any]]) -> None:
+    duplicates = [
+        id for id, count in Counter([id for id, _ in expanded_config]).items() if count > 1
+    ]
+    if duplicates:
+        raise ValueError(f"trying to set two configs for nodes {duplicates}.")
+
+
+@dataclass
+class BaseDAG(Generic[P, RVDAG]):
     """Data Structure containing ExecNodes with interdependencies.
 
     Please do not instantiate this class directly. Use the decorator `@dag` instead.
     The ExecNodes can be executed in parallel with the following restrictions:
         * Limited number of threads.
         * Parallelization constraint of each ExecNode (is_sequential attribute)
+        * Priority of each ExecNode (priority attribute)
+        * Specific Resource per ExecNode (resource attribute)
+    This Class has two flavors:
+        * DAG: for synchronous execution
+        * AsyncDAG: for asynchronous execution
+
+    Args:
+        exec_nodes: all the ExecNodes
+        input_uxns: all the input UsageExecNodes
+        return_uxns: the return UsageExecNodes of various types: None, a single value, tuple, list, dict.
+        max_concurrency: the maximal number of threads running in parallel
     """
 
-    def __init__(
-        self,
-        exec_nodes: Dict[Identifier, ExecNode],
-        input_uxns: List[UsageExecNode],
-        return_uxns: ReturnUXNsType,
-        max_concurrency: int = 1,
-        behavior: ErrorStrategy = ErrorStrategy.strict,
-    ):
-        """Constructor of the DAG. Should not be called directly. Instead use the `dag` decorator.
+    qualname: str
+    results: StrictDict[Identifier, Any]
+    exec_nodes: StrictDict[Identifier, ExecNode]
+    input_uxns: List[UsageExecNode]
+    return_uxns: ReturnUXNsType
+    max_concurrency: int = 1
+    graph_ids: DiGraphEx = field(init=False)
 
-        Args:
-            exec_nodes: all the ExecNodes
-            input_uxns: all the input UsageExecNodes
-            return_uxns: the return UsageExecNodes. These can be of various types: None, a single value, tuple, list, dict.
-            max_concurrency: the maximal number of threads running in parallel
-            behavior: specify the behavior if an ExecNode raises an Error. Three option are currently supported:
-                1. DAG.STRICT: stop the execution of all the DAG
-                2. DAG.ALL_CHILDREN: do not execute all children ExecNodes, and continue execution of the DAG
-                2. DAG.PERMISSIVE: continue execution of the DAG and ignore the error
-        """
-        self.max_concurrency = max_concurrency
-        self.behavior = behavior
-        self.return_uxns = return_uxns
-        self.input_uxns = input_uxns
+    def __post_init__(self) -> None:
+        self.graph_ids = DiGraphEx.from_exec_nodes(
+            input_nodes=self.input_uxns, exec_nodes=self.exec_nodes
+        )
 
-        # ExecNodes can be shared between Graphs, their call signatures might also be different
-        # NOTE: maybe this should be transformed into a property because there is a deepcopy for node_dict...
-        #  this means that there are different ExecNodes that are hanging arround in the same instance of the DAG
-        self.node_dict = exec_nodes
-        # Compute all the tags in the DAG to reduce overhead during computation
-        self.tagged_nodes = defaultdict(list)
-        for xn in self.node_dict.values():
-            if xn.tag:
-                if isinstance(xn.tag, Tag):
-                    self.tagged_nodes[xn.tag].append(xn)
-                # isinstance(xn.tag, tuple):
-                else:
-                    for t in xn.tag:
-                        self.tagged_nodes[t].append(xn)
-
-        # Might be useful in the future
-        self.node_dict_by_name: Dict[str, ExecNode] = {
-            exec_node.__name__: exec_node for exec_node in self.node_dict.values()
-        }
-
-        self.graph_ids = self._build_graph()
-
-        self.bckrd_deps = {
-            id_: list(self.graph_ids.predecessors(xn.id)) for id_, xn in self.node_dict.items()
-        }
-        self.frwrd_deps = {
-            id_: list(self.graph_ids.successors(xn.id)) for id_, xn in self.node_dict.items()
-        }
-
-        # calculate the sum of priorities of all recursive children
-        self._assign_compound_priority()
-
-        # make a valid execution sequence to run sequentially if needed
-        topological_order = self.graph_ids.topologically_sorted
-        self.exec_node_sequence = [self.node_dict[xn_id] for xn_id in topological_order]
-
-        self._validate()
-
-    @property
-    def max_concurrency(self) -> int:
-        """Maximal number of threads running in parallel. (will change!)."""
-        return self._max_concurrency
-
-    @max_concurrency.setter
-    def max_concurrency(self, value: int) -> None:
-        """Set the maximal number of threads running in parallel.
-
-        Args:
-            value (int): maximum number of threads running in parallel
-
-        Raises:
-            ValueError: if value is not a positive integer
-        """
-        if not isinstance(value, int):
+        # verification
+        if not isinstance(self.max_concurrency, int):
             raise ValueError("max_concurrency must be an int")
-        if value < 1:
+        if self.max_concurrency < 1:
             raise ValueError("Invalid maximum number of threads! Must be a positive integer")
-        self._max_concurrency = value
+        self._max_concurrency = self.max_concurrency
+
+        if not isinstance(self.results, StrictDict):
+            raise ValueError("results must be a StrictDict")
+        if not isinstance(self.exec_nodes, StrictDict):
+            raise ValueError("exec_nodes must be a StrictDict")
+
+    def draw(
+        self, *, include_args: bool = False, filename: Optional[str] = None, view: bool = True
+    ) -> None:
+        """Draws the Networkx directed graph.
+
+        Args:
+            include_args: whether to include the arguments or not
+            filename: the name of the file to save the graph to
+            view: whether to view the graph or not
+        """
+        from graphviz import Digraph
+
+        dot = Digraph()
+
+        for node_id in self.graph_ids.nodes():
+            node = self.get_node_by_id(node_id)
+            is_arg = isinstance(node, ArgExecNode)
+            if is_arg and not include_args:
+                continue
+
+            dot.node(node_id)
+            if is_arg:
+                dot.node(node_id, label=f"{node_id}")
+            else:
+                path_to_file, line_number = node.call_location.split(":")
+
+                dot.node(node_id, label=f"{node_id} #L{line_number}", URL="file://" + path_to_file)
+
+        for edge in self.graph_ids.edges():
+            if isinstance(self.get_node_by_id(edge[0]), ArgExecNode) and not include_args:
+                continue
+            dot.edge(edge[0], edge[1])
+
+        dot.render(filename, view=view)
 
     # getters
     def get_nodes_by_tag(self, tag: Tag) -> List[ExecNode]:
@@ -123,7 +153,8 @@ class DAG(Generic[P, RVDAG]):
 
         Note: the returned ExecNode is not modified by any execution!
             This means that you can not get the result of its execution via `DAG.get_nodes_by_tag(<tag>).result`.
-            In order to do that, you need to make a DAGExecution and then call `DAGExecution.get_nodes_by_tag(<tag>).result`, which will contain the results.
+            In order to do that, you need to make a DAGExecution and then call
+             `DAGExecution.get_nodes_by_tag(<tag>).result`, which will contain the results.
 
         Args:
             tag (Any): tag of the ExecNodes
@@ -131,26 +162,26 @@ class DAG(Generic[P, RVDAG]):
         Returns:
             List[ExecNode]: corresponding ExecNodes
         """
-        if isinstance(tag, Tag):
-            return self.tagged_nodes[tag]
-        raise TypeError(f"tag {tag} must be of Tag type. Got {type(tag)}")
+        return [self.exec_nodes[xn_id] for xn_id in self.graph_ids.get_tagged_nodes(tag)]
 
-    def get_node_by_id(self, id_: Identifier) -> ExecNode:
+    def get_node_by_id(self, node_id: Identifier) -> ExecNode:
         """Get the ExecNode with the given id.
 
         Note: the returned ExecNode is not modified by any execution!
             This means that you can not get the result of its execution via `DAG.get_node_by_id(<id>).result`.
-            In order to do that, you need to make a DAGExecution and then call `DAGExecution.get_node_by_id(<id>).result`, which will contain the results.
+            In order to do that, you need to make a DAGExecution and then call
+             `DAGExecution.get_node_by_id(<id>).result`, which will contain the results.
 
         Args:
-            id_ (Identifier): id of the ExecNode
+            node_id (Identifier): id of the ExecNode
 
         Returns:
             ExecNode: corresponding ExecNode
         """
-        # TODO: ? catch the keyError and
-        #   help the user know the id of the ExecNode by pointing to documentation!?
-        return self.node_dict[id_]
+        try:
+            return self.exec_nodes[node_id]
+        except KeyError as e:
+            raise ValueError(f"node {node_id} doesn't exist in the DAG.") from e
 
     def _get_single_xn_by_alias(self, alias: Alias) -> ExecNode:
         """Get the ExecNode corresponding to the given Alias.
@@ -164,25 +195,26 @@ class DAG(Generic[P, RVDAG]):
         Returns:
             ExecNode: the ExecNode corresponding to the given Alias
         """
-        xns = self._alias_to_ids(alias)
+        xns = self.alias_to_ids(alias)
         if len(xns) > 1:
             raise ValueError(
                 f"Alias {alias} is not unique. It points to {len(xns)} ExecNodes: {xns}"
             )
-        return self.node_dict[xns[0]]
+        return self.exec_nodes[xns[0]]
 
     # TODO: get node by usage (the order of call of an ExecNode)
 
-    # TODO: implement None for outputs to indicate a None output ? (this is not a prioritized feature)
-    # TODO: implement ellipsis for composing for the input & outputs
+    # TODO: implement ellipsis for composing with outputs
     # TODO: should we support kwargs when DAG.__call__ support kwargs?
-    # TODO: Maybe insert an ID into DAG that is related to the dependency describing function !? just like ExecNode
-    #  This will be necessary when we want to make a DAG containing DAGs besides ExecNodes
-    # NOTE: by doing this, we create a new ExecNode for each input.
-    #  Hence we loose all information related to the original ExecNode (tags, etc.)
-    #  Maybe a better way to do this is to transform the original ExecNode into an ArgExecNode
 
-    def compose(self, inputs: Union[Alias, Sequence[Alias]], outputs: Union[Alias, Sequence[Alias]], **kwargs: Dict[str, Any]) -> "DAG":  # type: ignore[type-arg]
+    def compose(
+        self,
+        qualname: str,
+        inputs: Union[Alias, Sequence[Alias]],
+        outputs: Union[Alias, Sequence[Alias]],
+        is_async: Optional[bool] = None,
+        **kwargs: Dict[str, Any],
+    ) -> "Union[AsyncDAG[P, RVDAG], DAG[P, RVDAG]]":
         """Compose a new DAG using inputs and outputs ExecNodes (Experimental).
 
         All provided `Alias`es must point to unique `ExecNode`s. Otherwise ValueError is raised
@@ -192,6 +224,8 @@ class DAG(Generic[P, RVDAG]):
         or a `Sequence` of `Alias`es in which case a Tuple of the values are returned.
         If outputs are specified as [], () is returned.
         The syntax is the following:
+
+        ```python
         >>> from tawazi import dag, xn, DAG
         >>> from typing import Tuple, Any
         >>> @xn
@@ -208,15 +242,17 @@ class DAG(Generic[P, RVDAG]):
         ...     res = z(x(1), y(1))
         ...     b = unwanted_xn()
         ...     return a, res, b
-        >>> composed_dag = pipe.compose([x, y], z)
+        >>> composed_dag = pipe.compose("twinkle", [x, y], z)
         >>> assert composed_dag(1, 1) == 2.0
         >>> # composed_dag: DAG[[int, str], float] = pipe.compose([x, y], [z])  # optional typing of the returned DAG!
         >>> # assert composed_dag(1, 1) == 2.0  # type checked!
-
+        ```
 
         Args:
-            inputs (Alias | List[Alias]): the Inputs nodes whose results are provided.
+            qualname (str): the name of the composed DAG
+            inputs (ellipsis, Alias | List[Alias]): the Inputs nodes whose results are provided. Provide ... to specify that you will provide every argument of the original DAG.
             outputs (Alias | List[Alias]): the Output nodes that must execute last, The ones that will generate results
+            is_async (bool | None): if True, the composed DAG will be an AsyncDAG, if False, it will be a DAG. Defaults to whatever the original DAG is.
             **kwargs (Dict[str, Any]): additional arguments to be passed to the DAG's constructor
         """
         # what happens for edge cases ??
@@ -229,10 +265,12 @@ class DAG(Generic[P, RVDAG]):
         # 4. cst cubgraph inputs is [], outputs is not [] but contains constants (-> works as expected)
         # 5. inputs is not [], outputs is [] same as 2.
         # 6. a subcase of the above (some inputs suffice to produce some of the outputs, but some inputs don't)
-        # 7. advanced usage: if inputs contain ... (i.e. Ellipsis) in this case we must expand it to reach all the remaining XN in a smart manner
+        # 7. advanced usage: if inputs contain ... (i.e. Ellipsis) in this case we must expand it to reach all the
+        # remaining XN in a smart manner
         #  we should keep the order of the inputs and outputs (future)
         # 8. what if some arguments have default values? should they be provided by the user?
-        # 9. how to specify that arguments of the original DAG should be provided by the user? the user should provide the input's ID which is not a stable Alias yet
+        # 9. how to specify that arguments of the original DAG should be provided by the user? the user should provide
+        # the input's ID which is not a stable Alias yet
 
         def _alias_or_aliases_to_ids(
             alias_or_aliases: Union[Alias, Sequence[Alias]]
@@ -265,7 +303,11 @@ class DAG(Generic[P, RVDAG]):
         # 1. get input ids and output ids.
         #  Alias should correspond to a single ExecNode,
         #  otherwise an ambiguous situation exists, raise error
-        in_ids = _alias_or_aliases_to_ids(inputs)
+        in_ids = (
+            [uxn.id for uxn in self.input_uxns]
+            if inputs is ...  # type: ignore[comparison-overlap]
+            else _alias_or_aliases_to_ids(inputs)
+        )
         out_ids = _alias_or_aliases_to_ids(outputs)
 
         # 2.1 contains all the ids of the nodes that will be in the new DAG
@@ -277,16 +319,16 @@ class DAG(Generic[P, RVDAG]):
         # 3. check edge cases
         # inputs should not be successors of inputs, otherwise (error)
         # and inputs should produce at least one of the outputs, otherwise (warning)
-        for i in in_ids:
+        for in_id in in_ids:
             # if pred is ancestor of an input, raise error
-            if i in in_ids_ancestors:
-                _raise_input_successor_of_input(i, set(in_ids))
+            if in_id in in_ids_ancestors:
+                _raise_input_successor_of_input(in_id, set(in_ids))
 
-            # if i doesn't produce any of the wanted outputs, raise a warning!
-            descendants: Set[Identifier] = nx.descendants(self.graph_ids, i)
+            # if in_id doesn't produce any of the wanted outputs, raise a warning!
+            descendants: Set[Identifier] = nx.descendants(self.graph_ids, in_id)
             if descendants.isdisjoint(out_ids):
                 warnings.warn(
-                    f"Input ExecNode {i} is not used to produce any of the requested outputs."
+                    f"Input ExecNode {in_id} is not used to produce any of the requested outputs."
                     f"Consider removing it from the inputs.",
                     stacklevel=2,
                 )
@@ -295,23 +337,21 @@ class DAG(Generic[P, RVDAG]):
 
         # 4.1 original DAG's inputs that don't contain default values.
         # used to detect missing inputs
-        dag_inputs_ids = [
-            uxn.id for uxn in self.input_uxns if self.node_dict[uxn.id].result is NoVal
-        ]
+        dag_inputs_ids = [uxn.id for uxn in self.input_uxns if uxn.id not in self.results]
 
         # 4.2 define helper function
-        def _add_missing_deps(candidate_id: Identifier, set_xn_ids: Set[Identifier]) -> None:
+        def _add_missing_deps(candidate_id: Identifier, xn_ids: Set[Identifier]) -> None:
             """Adds missing dependency to the set of ExecNodes that will be in the new DAG.
 
             Note: uses nonlocal variable dag_inputs_ids
 
             Args:
                 candidate_id (Identifier): candidate id of an `ExecNode` that will be in the new DAG
-                set_xn_ids (Set[Identifier]): Set of `ExecNode`s that will be in the new DAG
+                xn_ids (Set[Identifier]): Set of `ExecNode`s that will be in the new DAG
             """
             preds = self.graph_ids.predecessors(candidate_id)
             for pred in preds:
-                if pred not in set_xn_ids:
+                if pred not in xn_ids:
                     # this candidate is necessary to produce the output,
                     # it is an input to the original DAG
                     # it is not provided as an input to the composed DAG
@@ -321,8 +361,8 @@ class DAG(Generic[P, RVDAG]):
 
                     # necessary intermediate dependency.
                     # collect it in the set
-                    set_xn_ids.add(pred)
-                    _add_missing_deps(pred, set_xn_ids)
+                    xn_ids.add(pred)
+                    _add_missing_deps(pred, xn_ids)
 
         # 4.3 add all required dependencies for each output
         for o_id in out_ids:
@@ -331,128 +371,58 @@ class DAG(Generic[P, RVDAG]):
         # 5.1 copy the ExecNodes that will be in the composed DAG because
         #  maybe the composed DAG will modify them (e.g. change their tags)
         #  and we don't want to modify the original DAG
-        xn_dict = {xn_id: copy(self.node_dict[xn_id]) for xn_id in set_xn_ids}
+        # we avoid adding the inputs because they will be modified just afterwards
+        xn_dict = StrictDict(
+            (in_id, deepcopy(self.exec_nodes[in_id])) for in_id in set_xn_ids if in_id not in in_ids
+        )
 
-        # 5.2 change the inputs of the ExecNodes into ArgExecNodes
-        for xn_id, xn in xn_dict.items():
-            if xn_id in in_ids:
-                logger.debug("changing Composed-DAG's input {} into ArgExecNode", xn_id)
-                xn.__class__ = ArgExecNode
-                xn.exec_function = _make_raise_arg_error("composed", xn.id)
-                # eliminate all dependencies
-                xn.args = []
-                xn.kwargs = {}
+        # change input ExecNodes to ArgExecNodes
+        new_in_ids = [make_axn_id(qualname, old_id) for old_id in in_ids]
+        for old_id, new_id in zip(in_ids, new_in_ids):
+            logger.debug("changing Composed-DAG's input {} into ArgExecNode", new_id)
+            xn_dict[new_id] = ArgExecNode(new_id)
+
+            # because old_id changed, we must change it to new_id in its corresponding dependencies everywhere
+            for xn in xn_dict.values():
+                for i, xn_dep in enumerate(xn.args):
+                    # if the dependency of xn is an input_id of the newly composed DAG.
+                    if xn_dep.id == old_id:
+                        xn.args[i] = UsageExecNode(new_id, xn_dep.key)
+                for xn_dep_name, xn_dep in xn.kwargs.items():
+                    # if dependency of xn is an input_id of the newly composed DAG.
+                    if xn_dep.id == old_id:
+                        xn.kwargs[xn_dep_name] = UsageExecNode(new_id, xn_dep.key)
 
         # 5.3 make the inputs and outputs UXNs for the composed DAG
-        in_uxns = [UsageExecNode(xn_id) for xn_id in in_ids]
+        in_uxns = [UsageExecNode(xn_id) for xn_id in new_in_ids]
         # if a single value is returned make the output a single value
         out_uxns = _alias_or_aliases_to_uxns(outputs)
 
-        # 6. return the composed DAG
-        # ignore[arg-type] because the type of the kwargs is not known
-        return DAG(xn_dict, in_uxns, out_uxns, **kwargs)  # type: ignore[arg-type]
-
-    def _build_graph(self) -> DiGraphEx:
-        """Builds the graph and the sequence order for the computation.
-
-        Raises:
-            NetworkXUnfeasible: if the graph has cycles
-        """
-        graph_ids = DiGraphEx()
-        # 1. Make the graph
-        # 1.1 add nodes
-        for id_ in self.node_dict.keys():
-            graph_ids.add_node(id_)
-
-        # 1.2 add edges
-        for xn in self.node_dict.values():
-            edges = [(dep.id, xn.id) for dep in xn.dependencies]
-            graph_ids.add_edges_from(edges)
-
-        # 2. Validate the DAG: check for circular dependencies
-        cycle = graph_ids._find_cycle()
-        if cycle:
-            raise NetworkXUnfeasible(
-                f"the product contains at least a circular dependency: {cycle}"
-            )
-        return graph_ids
-
-    def _validate(self) -> None:
-        input_ids = [uxn.id for uxn in self.input_uxns]
-        # validate setup ExecNodes
-        for xn in self.node_dict.values():
-            if xn.setup and any(dep.id in input_ids for dep in xn.dependencies):
-                raise TawaziUsageError(
-                    f"The ExecNode {xn} takes as parameters one of the DAG's input parameter"
-                )
-        # future validations...
-
-    def _assign_compound_priority(self) -> None:
-        """Assigns a compound priority to all nodes in the graph.
-
-        The compound priority is the sum of the priorities of all children recursively.
-        """
-        # 1. deepcopy graph_ids because it will be modified (pruned)
-        graph_ids = deepcopy(self.graph_ids)
-        leaf_ids = graph_ids.leaf_nodes
-
-        # 2. assign the compound priority for all the remaining nodes in the graph:
-        # Priority assignment happens by epochs:
-        # 2.1. during every epoch, we assign the compound priority for the parents of the current leaf nodes
-        # 2.2. at the end of every epoch, we trim the graph from its leaf nodes;
-        #       hence the previous parents become the new leaf nodes
-        while len(graph_ids) > 0:
-            # Epoch level
-            for leaf_id in leaf_ids:
-                leaf_node = self.node_dict[leaf_id]
-
-                for parent_id in self.bckrd_deps[leaf_id]:
-                    # increment the compound_priority of the parent node by the leaf priority
-                    parent_node = self.node_dict[parent_id]
-                    parent_node.compound_priority += leaf_node.compound_priority
-
-                # trim the graph from its leaf nodes
-                graph_ids.remove_node(leaf_id)
-
-            # assign the new leaf nodes
-            leaf_ids = graph_ids.leaf_nodes
-
-    def draw(self, k: float = 0.8, display: bool = True, t: int = 3) -> None:
-        """Draws the Networkx directed graph.
-
-        Args:
-            k (float): parameter for the layout of the graph, the higher, the further the nodes apart. Defaults to 0.8.
-            display (bool): display the layout created. Defaults to True.
-            t (int): time to display in seconds. Defaults to 3.
-        """
-        import matplotlib.pyplot as plt
-
-        # TODO: use graphviz instead! it is much more elegant
-
-        pos = nx.spring_layout(self.graph_ids, seed=42069, k=k, iterations=20)
-        nx.draw(self.graph_ids, pos, with_labels=True)
-        if display:
-            plt.ion()
-            plt.show()
-            time.sleep(t)
-            plt.close()
-
-    def _execute(
-        self,
-        graph: DiGraphEx,
-        modified_node_dict: Optional[Dict[str, ExecNode]] = None,
-        call_id: str = "",
-    ) -> Dict[Identifier, Any]:
-        return execute(
-            node_dict=self.node_dict,
-            max_concurrency=self.max_concurrency,
-            behavior=self.behavior,
-            graph=graph,
-            modified_node_dict=modified_node_dict,
-            call_id=call_id,
+        # 6. extract the results of only the remaining ExecNodes
+        results = StrictDict(
+            (node_id, result) for node_id, result in self.results.items() if node_id in xn_dict
         )
 
-    def _alias_to_ids(self, alias: Alias) -> List[Identifier]:
+        # 7. return the composed DAG/AsyncDAG
+        if is_async is False or (is_async is None and isinstance(self, DAG)):
+            return DAG(
+                qualname=qualname,
+                results=results,
+                exec_nodes=xn_dict,
+                input_uxns=in_uxns,
+                return_uxns=out_uxns,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        return AsyncDAG(
+            qualname=qualname,
+            results=results,
+            exec_nodes=xn_dict,
+            input_uxns=in_uxns,
+            return_uxns=out_uxns,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def alias_to_ids(self, alias: Alias) -> List[Identifier]:
         """Extract an ExecNode ID from an Alias (Tag, ExecNode ID or ExecNode).
 
         Args:
@@ -466,313 +436,78 @@ class DAG(Generic[P, RVDAG]):
             TawaziTypeError: if the Type of the identifier is not Tag, Identifier or ExecNode
         """
         if isinstance(alias, ExecNode):
-            if alias.id not in self.node_dict:
+            if alias.id not in self.exec_nodes:
                 raise ValueError(f"ExecNode {alias} not found in DAG")
             return [alias.id]
         # todo: do further validation for the case of the tag!!
         if isinstance(alias, (Identifier, tuple)):
             # if leaves_identification is not ExecNode, it can be either
             #  1. a Tag (Highest priority in case an id with the same value exists)
-            nodes = self.tagged_nodes.get(alias)
+            nodes = [self.exec_nodes[xn_id] for xn_id in self.graph_ids.get_tagged_nodes(alias)]
             if nodes:
                 return [node.id for node in nodes]
             #  2. or a node id!
-            if isinstance(alias, Identifier) and alias in self.node_dict:
+            if isinstance(alias, Identifier) and alias in self.exec_nodes:
                 node = self.get_node_by_id(alias)
                 return [node.id]
             raise ValueError(
                 f"node or tag {alias} not found in DAG.\n"
-                f" Available nodes are {self.node_dict}.\n"
-                f" Available tags are {list(self.tagged_nodes.keys())}"
+                f" Available nodes are {self.exec_nodes}.\n"
+                f" Available tags are {list(self.graph_ids.tags)}"
             )
         raise TawaziTypeError(
             "target_nodes must be of type ExecNode, "
             f"str or tuple identifying the node but provided {alias}"
         )
 
-    # NOTE: this function is named wrongly!
-    def _get_target_ids(self, target_nodes: Sequence[Alias]) -> List[Identifier]:
-        """Get the ids of ExecNodes corresponding to target_nodes.
+    def get_multiple_nodes_aliases(self, nodes: Sequence[Alias]) -> List[Identifier]:
+        """Ensure correct Identifiers from aliases.
 
         Args:
-            target_nodes (Optional[List[Alias]]): list of a ExecNode Aliases that the user might provide to run a subgraph
+            nodes: iterable of node aliases
 
         Returns:
-            List[Identifier]: Leaf ExecNodes' Identities
+            list of correct Identifiers
         """
-        return list(chain(*(self._alias_to_ids(alias) for alias in target_nodes)))
+        return list(chain(*(self.alias_to_ids(alias) for alias in nodes)))
 
-    def _extend_leaves_ids_debug_xns(self, leaves_ids: List[Identifier]) -> List[Identifier]:
-        """Extend the leaves_ids to contain all runnable debug node ids.
-
-        For example:
-        A
-        |
-        B
-        | \
-        D E
-
-        if D is not a debug ExecNode and E is a debug ExecNode.
-        If the subgraph whose leaf ExecNode D is executed,
-        E should also be included in the execution because it can be executed (debug node whose inputs are provided)
-        Hence we should extend the subgraph containing only D to also contain E
-
-        Args:
-            leaves_ids (List[Identifier]): the leaves ids of the subgraph
-
-        Returns:
-            List[Identifier]: the leaves ids of the new extended subgraph that contains more debug ExecNodes
-        """
-        new_debug_xn_discovered = True
-        while new_debug_xn_discovered:
-            new_debug_xn_discovered = False
-            for id_ in leaves_ids:
-                for successor_id in self.frwrd_deps[id_]:
-                    is_successor_debug = self.node_dict[successor_id].debug
-                    if successor_id not in leaves_ids and is_successor_debug:
-                        # a new debug XN has been discovered!
-                        preds_of_succs_ids = [xn_id for xn_id in self.bckrd_deps[successor_id]]
-
-                        if set(preds_of_succs_ids).issubset(set(leaves_ids)):
-                            new_debug_xn_discovered = True
-                            # this new XN can run by only running the current leaves_ids
-                            leaves_ids.append(successor_id)
-        return leaves_ids
-
-    def setup(
+    def _pre_setup(
         self,
-        target_nodes: Optional[Sequence[Alias]] = None,
-        exclude_nodes: Optional[Sequence[Alias]] = None,
-    ) -> None:
-        """Run the setup ExecNodes for the DAG.
-
-        If target_nodes are provided, run only the necessary setup ExecNodes, otherwise will run all setup ExecNodes.
-        NOTE: `DAG` arguments should not be passed to setup ExecNodes.
-            Only pass in constants or setup `ExecNode`s results.
-
-
-        Args:
-            target_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to use in the DAG.
-                This might include setup or non setup ExecNodes. If None is provided, will run all setup ExecNodes. Defaults to None.
-            exclude_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to exclude from the DAG.
-                The user is responsible for ensuring that the overlapping between the target_nodes and exclude_nodes is logical.
-        """
-        # 1. select all setup ExecNodes
-        #  do not copy the setup nodes because we want them to be modified per DAG instance!
-        all_setup_nodes = {id_: xn for id_, xn in self.node_dict.items() if xn.setup}
-
-        # 2. if target_nodes is not provided run all setup ExecNodes
-        if target_nodes is None:
-            target_ids = list(all_setup_nodes.keys())
-            graph = self._make_subgraph(target_ids, exclude_nodes)
-
-        else:
-            # 2.1 the leaves_ids that the user wants to execute
-            #  however they might contain non setup nodes... so we should extract all the nodes ids
-            #  that must be run in order to run the target_nodes ExecNodes
-            #  afterwards we can remove the non setup nodes
-            target_ids = self._get_target_ids(target_nodes)
-
-            # 2.2 filter non setup ExecNodes
-            graph = self._make_subgraph(target_ids, exclude_nodes)
-            ids_to_remove = [id_ for id_ in graph if id_ not in all_setup_nodes]
-
-            for id_ in ids_to_remove:
-                graph.remove_node(id_)
-        # TODO: handle debug XNs!
-
-        self._execute(graph)
-
-    def executor(self, **kwargs: Any) -> "DAGExecution[P, RVDAG]":
-        """Generates a DAGExecution for the DAG.
-
-        Args:
-            **kwargs (Any): keyword arguments to be passed to DAGExecution's constructor
-
-        Returns:
-            DAGExecution: an executor for the DAG
-        """
-        return DAGExecution(self, **kwargs)
-
-    def _make_subgraph(
-        self,
-        target_nodes: Optional[Sequence[Alias]] = None,
-        exclude_nodes: Optional[Sequence[Alias]] = None,
-    ) -> nx.DiGraph:
-        graph = deepcopy(self.graph_ids)
-
+        target_nodes: Optional[Sequence[Alias]],
+        exclude_nodes: Optional[Sequence[Alias]],
+        root_nodes: Optional[Sequence[Alias]],
+    ) -> DiGraphEx:
+        # 1. if target_nodes is not provided run all setup ExecNodes
         if target_nodes is not None:
-            target_ids = self._get_target_ids(target_nodes)
-            graph.subgraph_leaves(target_ids)
-
-        if exclude_nodes is not None:
-            exclude_ids = list(chain(*(self._alias_to_ids(alias) for alias in exclude_nodes)))
-
-            for id_ in exclude_ids:
-                # maybe previously removed by :
-                # 1. not being inside the subgraph
-                # 2. being a successor of an excluded node
-                if id_ in graph:
-                    graph.remove_recursively(id_)
-
-        if target_nodes and exclude_nodes:
-            for id_ in target_ids:
-                if id_ not in graph:
-                    raise TawaziUsageError(
-                        f"target_nodes include {id_} which is removed by exclude_nodes: {exclude_ids}, "
-                        f"please verify that they don't overlap in a non logical way!"
-                    )
-
-        # handle debug nodes
-        if cfg.RUN_DEBUG_NODES:
-            leaves_ids = graph.leaf_nodes
-            # after extending leaves_ids, we should do a recheck because this might recreate another debug-able XN...
-            target_ids = self._extend_leaves_ids_debug_xns(leaves_ids)
-
-            # extend the graph with the debug XNs
-            # This is not efficient but it is ok since we are debugging the code anyways
-            debug_graph = deepcopy(self.graph_ids)
-            debug_graph.subgraph_leaves(list(graph.nodes) + target_ids)
-            graph = debug_graph
-
-        # 3. clean all debug XNs if they shouldn't run!
+            target_nodes = self.get_multiple_nodes_aliases(target_nodes)
         else:
-            to_remove = [id_ for id_ in graph if self.node_dict[id_].debug]
-            for id_ in to_remove:
-                graph.remove_node(id_)
+            target_nodes = self.graph_ids.setup_nodes
 
+        # 2. the leaves_ids that the user wants to execute
+        if exclude_nodes is not None:
+            exclude_nodes = self.get_multiple_nodes_aliases(exclude_nodes)
+
+        if root_nodes is not None:
+            root_nodes = self.get_multiple_nodes_aliases(root_nodes)
+
+        graph = self.graph_ids.make_subgraph(
+            target_nodes=target_nodes, exclude_nodes=exclude_nodes, root_nodes=root_nodes
+        )
+
+        # 3. remove non setup nodes
+        graph.remove_nodes_from(
+            [node_id for node_id in graph if node_id not in self.graph_ids.setup_nodes]
+        )
         return graph
 
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RVDAG:
-        """Execute the DAG scheduler via a similar interface to the function that describes the dependencies.
-
-        Note: Currently kwargs are not supported.
-            They will supported soon!
-
-        Args:
-            *args (P.args): arguments to be passed to the call of the DAG
-            **kwargs (P.kwargs): keyword arguments to be passed to the call of the DAG
-
-        Returns:
-            RVDAG: return value of the DAG's execution
-
-        Raises:
-            TawaziUsageError: kwargs are passed
-        """
-        if kwargs:
-            raise TawaziUsageError(f"currently DAG does not support keyword arguments: {kwargs}")
-        # 1. generate the subgraph to be executed
-        graph = self._make_subgraph()
-
-        # 2. copy the ExecNodes
-        call_xn_dict = self._make_call_xn_dict(*args)
-
-        # 3. Execute the scheduler
-        all_nodes_dict = self._execute(graph, call_xn_dict)
-
-        # 4. extract the returned value/values
-        return self._get_return_values(all_nodes_dict)  # type: ignore[return-value]
-
-    def _make_call_xn_dict(self, *args: Any) -> Dict[Identifier, ExecNode]:
-        """Generate the calling ExecNode dict.
-
-        This is a dict containing ExecNodes that will be executed (hence modified) by the DAG scheduler.
-        This takes into consideration:
-         1. deep copying the ExecNodes
-         2. filling the arguments of the call
-         3. skipping the copy for setup ExecNodes
-
-        Args:
-            *args (Any): arguments to be passed to the call of the DAG
-
-        Returns:
-            Dict[Identifier, ExecNode]: The modified ExecNode dict which will be executed by the DAG scheduler.
-
-        Raises:
-            TypeError: If called with an invalid number of arguments
-        """
-        # 1. deepcopy the node_dict because it will be modified by the DAG's execution
-        call_xn_dict = copy_non_setup_xns(self.node_dict)
-
-        # 2. parse the input arguments of the pipeline
-        # 2.1 default valued arguments can be skipped and not provided!
-        # note: if not enough arguments are provided then the code will fail
-        # inside the DAG's execution through the raise_err lambda
-        if args:
-            # 2.2 can't provide more than enough arguments
-            if len(args) > len(self.input_uxns):
-                raise TypeError(
-                    f"The DAG takes a maximum of {len(self.input_uxns)} arguments. {len(args)} arguments provided"
-                )
-
-            # 2.3 modify ExecNodes corresponding to input ArgExecNodes
-            for ind_arg, arg in enumerate(args):
-                node_id = self.input_uxns[ind_arg].id
-
-                call_xn_dict[node_id].result = arg
-
-        return call_xn_dict
-
-    def _get_return_values(self, xn_dict: Dict[Identifier, ExecNode]) -> RVTypes:
-        """Extract the return value/values from the output of the DAG's scheduler!
-
-        Args:
-            xn_dict (Dict[Identifier, ExecNode]): Modified ExecNodes returned by the DAG's scheduler
-
-        Raises:
-            TawaziTypeError: if the type of the return value is not compatible with RVTypes
-
-        Returns:
-            RVTypes: the actual values extracted from xn_dict
-        """
-        return_uxns = self.return_uxns
-        if return_uxns is None:
-            return None
-        if isinstance(return_uxns, UsageExecNode):
-            return return_uxns.result(xn_dict)
-        if isinstance(return_uxns, (tuple, list)):
-            gen = (ren_uxn.result(xn_dict) for ren_uxn in return_uxns)
-            if isinstance(return_uxns, tuple):
-                return tuple(gen)
-            if isinstance(return_uxns, list):
-                return list(gen)
-        if isinstance(return_uxns, dict):
-            return {key: ren_uxn.result(xn_dict) for key, ren_uxn in return_uxns.items()}
-
-        raise TawaziTypeError("Return type for the DAG can only be a single value, Tuple or List")
-
-    # NOTE: this function should be used in case there was a bizarre behavior noticed during
-    #   the execution of the DAG via DAG.execute(...)
-    def _safe_execute(
-        self,
-        *args: Any,
-        target_nodes: Optional[List[Alias]] = None,
-        exclude_nodes: Optional[List[Alias]] = None,
-    ) -> Any:
-        """Execute the ExecNodes in topological order without priority in for loop manner for debugging purposes (Experimental).
-
-        Args:
-            *args (Any): Positional arguments passed to the DAG
-            target_nodes (Optional[List[Alias]]): the ExecNodes that should be considered to construct the subgraph
-            exclude_nodes (Optional[List[Alias]]): the ExecNodes that shouldn't run
-
-        Returns:
-            Any: the result of the execution of the DAG.
-             If an ExecNode returns a value in the DAG but is not executed, it will return None.
-        """
-        # 1. make the graph_ids to be executed!
-        graph = self._make_subgraph(target_nodes, exclude_nodes)
-
-        # 2. make call_xn_dict that will be modified
-        call_xn_dict = self._make_call_xn_dict(*args)
-
-        # 3. deep copy the node_dict to store the results in each node
-        for xn_id in graph.topologically_sorted:
-            # only execute ExecNodes that are part of the subgraph
-            call_xn_dict[xn_id]._execute(call_xn_dict)
-
-        # 4. make returned values
-        return self._get_return_values(call_xn_dict)
+    def _expand_config(
+        self, config_nodes: Dict[Union[Tag, Identifier], Any]
+    ) -> List[Tuple[Identifier, Any]]:
+        expanded_config = []
+        for alias, conf_node in config_nodes.items():
+            ids = self.alias_to_ids(alias)
+            expanded_config.extend([(id, conf) for id, conf in zip(ids, len(ids) * [conf_node])])
+        return expanded_config
 
     def config_from_dict(self, config: Dict[str, Any]) -> None:
         """Allows reconfiguring the parameters of the nodes from a dictionary.
@@ -784,41 +519,21 @@ class DAG(Generic[P, RVDAG]):
         Raises:
             ValueError: if two nodes are configured by the provided config (which is ambiguous)
         """
-
-        def _override_node_config(n: ExecNode, cfg: Dict[str, Any]) -> bool:
-            if "is_sequential" in cfg:
-                n.is_sequential = cfg["is_sequential"]
-
-            if "priority" in cfg:
-                n.priority = cfg["priority"]
-                return True
-
-            return False
-
-        prio_flag = False
-        visited: Dict[str, Any] = {}
         if "nodes" in config:
-            for alias, conf_node in config["nodes"].items():
-                ids_ = self._alias_to_ids(alias)
-                for node_id in ids_:
-                    if node_id not in visited:
-                        node = self.get_node_by_id(node_id)
-                        node_prio_flag = _override_node_config(node, conf_node)
-                        prio_flag = node_prio_flag or prio_flag  # keep track of flag
-
-                    else:
-                        raise ValueError(
-                            f"trying to set two configs for node {node_id}.\n 1) {visited[node_id]}\n 2) {conf_node}"
-                        )
-
-                    visited[node_id] = conf_node
+            expanded_config = self._expand_config(config["nodes"])
+            detect_duplicates(expanded_config)
+            for node_id, conf_node in expanded_config:
+                node = self.get_node_by_id(node_id)
+                values = node._conf_to_values(conf_node)
+                self.exec_nodes.force_set(node_id, type(node)(**values))
 
         if "max_concurrency" in config:
             self.max_concurrency = config["max_concurrency"]
 
-        if prio_flag:
-            # if we changed the priority of some nodes we need to recompute the compound prio
-            self._assign_compound_priority()
+        # we might have changed the priority of some nodes we need to recompute the DiGraph
+        self.graph_ids = DiGraphEx.from_exec_nodes(
+            input_nodes=self.input_uxns, exec_nodes=self.exec_nodes
+        )
 
     def config_from_yaml(self, config_path: str) -> None:
         """Allows reconfiguring the parameters of the nodes from a YAML file.
@@ -827,7 +542,7 @@ class DAG(Generic[P, RVDAG]):
             config_path: the path to the YAML file
         """
         with open(config_path) as f:
-            yaml_config = yaml.load(f, Loader=_UniqueKeyLoader)  # noqa: S506
+            yaml_config = yaml.load(f, Loader=UniqueKeyLoader)  # noqa: S506
 
         self.config_from_dict(yaml_config)
 
@@ -843,172 +558,533 @@ class DAG(Generic[P, RVDAG]):
         self.config_from_dict(json_config)
 
 
-# TODO: check if the arguments are the same, then run the DAG using the from_cache.
-#  If the arguments are not the same, then rerun the DAG!
-class DAGExecution(Generic[P, RVDAG]):
-    """A disposable callable instance of a DAG.
+@dataclass
+class DAG(BaseDAG[P, RVDAG]):
+    """SyncDAG implementation of the BaseDAG."""
 
-    It holds information about the last execution. Hence it is not threadsafe.
-    It might be reusable, however it is not recommended to reuse an instance of DAGExecutor!.
-    """
-
-    def __init__(
+    def executor(
         self,
-        dag: DAG[P, RVDAG],
-        *,
         target_nodes: Optional[Sequence[Alias]] = None,
         exclude_nodes: Optional[Sequence[Alias]] = None,
+        root_nodes: Optional[Sequence[Alias]] = None,
         cache_deps_of: Optional[Sequence[Alias]] = None,
         cache_in: str = "",
         from_cache: str = "",
-        call_id: Optional[str] = None,
-    ):
-        """Constructor.
+    ) -> "DAGExecution[P, RVDAG]":
+        """Generates a DAGExecution for the DAG.
 
         Args:
-            dag (DAG): The attached DAG.
-            target_nodes (Optional[List[Alias]]): The leave ExecNodes to execute.
-                If None will execute all ExecNodes.
+            target_nodes: the nodes to execute, excluding all nodes that can be excluded
+            exclude_nodes: the nodes to exclude from the execution
+            root_nodes: these nodes and their children will be included in the execution
+            cache_deps_of: which nodes to cache the dependencies of
+            cache_in: the path to the file where to cache
+            from_cache: the cache
+
+        Returns:
+            the DAGExecution object associated with the dag
+        """
+        return DAGExecution(
+            dag=self,
+            target_nodes=target_nodes,
+            exclude_nodes=exclude_nodes,
+            root_nodes=root_nodes,
+            cache_deps_of=cache_deps_of,
+            cache_in=cache_in,
+            from_cache=from_cache,
+        )
+
+    def setup(
+        self,
+        target_nodes: Optional[Sequence[Alias]] = None,
+        exclude_nodes: Optional[Sequence[Alias]] = None,
+        root_nodes: Optional[Sequence[Alias]] = None,
+    ) -> None:
+        """Run the setup ExecNodes for the DAG.
+
+        If target_nodes are provided, run only the necessary setup ExecNodes, otherwise will run all setup ExecNodes.
+        NOTE: `DAG` arguments should not be passed to setup ExecNodes.
+            Only pass in constants or setup `ExecNode`s results.
+
+        Args:
+            target_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to use in the DAG.
+                This might include setup or non setup ExecNodes. If None is provided, will run all setup ExecNodes.
                 Defaults to None.
-            exclude_nodes (Optional[List[Alias]]): The leave ExecNodes to exclude.
-                If None will exclude all ExecNodes.
-                Defaults to None.
-            cache_deps_of (Optional[List[Alias]]): cache all the dependencies of these nodes.
-                This option can not be used together with target_nodes nor exclude_nodes.
-            cache_in (str):
-                the path to the file where the execution should be cached.
-                The path should end in `.pkl`.
-                Will skip caching if `cache_in` is Falsy.
-                Will raise PickleError if any of the values passed around in the DAG is not pickleable.
-                Defaults to "".
-            from_cache (str):
-                the path to the file where the execution should be loaded from.
-                The path should end in `.pkl`.
-                Will skip loading from cache if `from_cache` is Falsy.
-                Defaults to "".
-            call_id (Optional[str]): identification of the current execution.
-                This will be inserted into thread_name_prefix while executing the threadPool.
-                It will be used in the future for identifying the execution inside Processes etc.
+            exclude_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to exclude from the DAG.
+                The user is responsible for ensuring that the overlapping between the target_nodes
+                and exclude_nodes is logical.
+            root_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to select as ancestor nodes.
+                The user is responsible for ensuring that the overlapping between the target_nodes, the exclude_nodes
+                and the root nodes is logical.
         """
-        # todo: Maybe we can support .dill to extend the possibilities of the exchanged values, but this won't solve the whole problem
+        graph = self._pre_setup(target_nodes, exclude_nodes, root_nodes)
 
-        self.dag = dag
-        self.target_nodes = target_nodes
-        self.exclude_nodes = exclude_nodes
-        self.cache_deps_of = cache_deps_of
-        self.cache_in = cache_in
-        self.from_cache = from_cache
-        # NOTE: from_cache is orthogonal to cache_in which means that if cache_in is set at the same time as from_cache.
-        #  in this case the DAG will be loaded from_cache and the results will be saved again to the cache_in file.
-        self.call_id = call_id
+        # 4. execute the graph and set the results to setup_results
+        _, self.results, _ = sync_execute(
+            exec_nodes=self.exec_nodes,
+            results=self.results,
+            max_concurrency=self.max_concurrency,
+            graph=graph,
+        )
 
-        # get the leaves ids to execute in case of a subgraph
-        self.target_nodes = target_nodes
-        self.exclude_nodes = exclude_nodes
+    # TODO: discuss whether we want to expose it or not
+    def run_subgraph(
+        self, subgraph: DiGraphEx, results: Optional[StrictDict[Identifier, Any]], *args: P.args
+    ) -> Tuple[
+        StrictDict[Identifier, ExecNode],
+        StrictDict[Identifier, Any],
+        StrictDict[Identifier, Profile],
+    ]:
+        """Run a subgraph of the original graph (might be the same graph).
 
-        self.xn_dict: Dict[Identifier, ExecNode] = {}
-        self.results: Dict[Identifier, Any] = {}
-
-        self._construct_dynamic_attributes()
-
-        self.executed = False
-
-    def _construct_dynamic_attributes(self) -> None:
-        self.graph = self._make_graph()
-        self.scheduled_nodes = self.graph.nodes
-
-    def _make_graph(self) -> nx.DiGraph:
-        """Make the graph of the execution.
-
-        This method is called only once per instance.
-        """
-        # logic parts
-        if self.cache_deps_of is not None:
-            return self.dag._make_subgraph(self.cache_deps_of)
-
-        return self.dag._make_subgraph(self.target_nodes, self.exclude_nodes)
-
-    @property
-    def cache_in(self) -> str:
-        """The path to the file where the execution should be cached.
+        Args:
+            subgraph: the subgraph to run
+            results: the results provided from the dag (containing setup) or coming from a modified DAG (from DAGExecution)
+            *args: the args to pass to the graph
 
         Returns:
-            str: The path to the file where the execution should be cached.
+            a mapping between the execnodes and there identifiers
         """
-        return self._cache_in
+        if results is None:
+            results = extend_results_with_args(self.results, self.input_uxns, *args)
+        else:
+            results = extend_results_with_args(results, self.input_uxns, *args)
 
-    @cache_in.setter
-    def cache_in(self, cache_in: str) -> None:
-        if cache_in and not cache_in.endswith(".pkl"):
-            raise ValueError("cache_in should end with.pkl")
-        self._cache_in = cache_in
+        exec_nodes, results, profiles = sync_execute(
+            exec_nodes=self.exec_nodes,
+            results=results,
+            max_concurrency=self.max_concurrency,
+            graph=subgraph,
+        )
 
-    @property
-    def from_cache(self) -> str:
-        """Get the file path from which the cached execution should be loaded.
+        # set DAG.results to the obtained value from setup ExecNodes
+        for node_id, result in results.items():
+            xn = self.exec_nodes[node_id]
+            if xn.setup and not xn.executed(self.results):
+                logger.debug("Setting result of setup ExecNode {} to {}", node_id, result)
+                logger.debug("Future executions will use this result.")
+                self.results[node_id] = result
+
+        return exec_nodes, results, profiles
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RVDAG:
+        """Execute the DAG scheduler via a similar interface to the function that describes the dependencies.
+
+        Note: Currently kwargs are not supported.
+
+        Args:
+            *args (P.args): arguments to be passed to the call of the DAG
+            **kwargs (P.kwargs): keyword arguments to be passed to the call of the DAG
 
         Returns:
-            str: the file path of the cached execution
+            RVDAG: return value of the DAG's execution
+
+        Raises:
+            TawaziUsageError: kwargs are passed
         """
-        return self._from_cache
+        description_context = node.exec_nodes_lock.locked()
+        if kwargs:
+            # is_active is only allowed when describing a SubDAG
+            if not description_context or set(kwargs.keys()) != {ARG_NAME_ACTIVATE}:
+                raise TawaziUsageError(
+                    f"currently DAG does not support keyword arguments: {kwargs}"
+                )
 
-    @from_cache.setter
-    def from_cache(self, from_cache: str) -> None:
-        if from_cache and not from_cache.endswith(".pkl"):
-            raise ValueError("from_cache should end with.pkl")
-        self._from_cache = from_cache
+        if description_context:
+            logger.warning("Describing SubDAG {} in DAG", self)
 
-    @property
-    def cache_deps_of(self) -> Optional[Sequence[Alias]]:
-        """Cache all the dependencies of these nodes.
+            # NOTE: can't call the base describing function because composed DAGs can't be supported in that case
+            #  so must modify ExecNodes of SubDAG
+            node.DAG_PREFIX.append(self.qualname)
 
-        Returns:
-            Optional[List[Alias]]: List of Aliases passed to cache_deps_of while instantiating DAGExecution
-        """
-        return self._cache_deps_of
+            def to_subdag_id(id_: str) -> str:
+                return ".".join(node.DAG_PREFIX + [id_])
 
-    @cache_deps_of.setter
-    def cache_deps_of(self, cache_deps_of: Optional[Sequence[Alias]]) -> None:
-        if (
-            self.target_nodes is not None or self.exclude_nodes is not None
-        ) and cache_deps_of is not None:
-            raise ValueError(
-                "cache_deps_of can not be used together with target_nodes or exclude_nodes"
+            # only the ExecNodes of the SubDAG must be affected by the is_active
+            is_active = False if ARG_NAME_ACTIVATE not in kwargs else kwargs[ARG_NAME_ACTIVATE]
+
+            input_uxns = [UsageExecNode(to_subdag_id(uxn.id), uxn.key) for uxn in self.input_uxns]
+
+            # provided args to the subdag
+            arg_uxns = construct_subdag_arg_uxns(
+                *args, to_subdag_id=to_subdag_id, qualname=self.qualname
             )
-        self._cache_deps_of = cache_deps_of
 
-    # we need to reimplement the public methods of DAG here in order to have a constant public interface
-    # getters
-    def get_nodes_by_tag(self, tag: Tag) -> List[ExecNode]:
-        """Get all the nodes with the given tag.
+            registered_input_ids: List[str] = []
+            # provided *args to the call is <= than input_uxns! because of defaults args
+            for axn, uxn in zip(arg_uxns, input_uxns):  # strict=False
+                # a stub that fills the value of an input ExecNode with an arg of the subdag
+                stub: LazyExecNode[[UsageExecNode], UsageExecNode] = LazyExecNode(
+                    id_=uxn.id,
+                    exec_function=lambda x: x,
+                    resource=consts.Resource.main_thread,
+                    args=[axn],
+                    # during subdag construction,
+                    # there are only two frames to get to the actual call site
+                    call_location_frame=2,
+                )
+                # register this LazyExecNode in the dict
+                # pass kwargs to pass in the twz_active!
+                _val: UsageExecNode = stub(axn, **kwargs)
+                registered_input_ids.append(uxn.id)
+
+            # updating ids of results already registered in the DAG due to pipeline.setup and default args
+            node.results.update(
+                StrictDict((to_subdag_id(id_), res) for id_, res in self.results.items())
+            )
+
+            # updating values of the ExecNodes with the new Ids only for the inputs that were changed!
+            graph = DiGraphEx()
+            for xn in self.exec_nodes.values():
+                graph.add_exec_node(xn)
+            # must go by order because Dict doesn't respect the order of insertion
+            while len(graph):
+                id_ = graph.remove_any_root_node()
+                exec_node = self.exec_nodes[id_]
+                new_id = to_subdag_id(id_)
+                # input ExecNode was already registered during step for zip
+                if new_id in registered_input_ids:
+                    logger.debug(
+                        "Skipping ExecNode {} because the input is already registered", new_id
+                    )
+                    continue
+
+                values = asdict(exec_node)
+                values["id_"] = new_id
+
+                values["args"] = [
+                    UsageExecNode(to_subdag_id(uxn.id), uxn.key) for uxn in exec_node.args
+                ]
+                values["kwargs"] = {
+                    to_subdag_id(id_): UsageExecNode(to_subdag_id(uxn.id), uxn.key)
+                    for id_, uxn in exec_node.kwargs.items()
+                }
+                if not exec_node.setup:
+                    if exec_node.active is not None:
+                        values["active"] = UsageExecNode(
+                            to_subdag_id(exec_node.active.id), exec_node.active.key
+                        )
+
+                    if is_active is not False:
+                        if exec_node.active is not None:
+                            raise RuntimeError(
+                                f"Trying to set active status for ExecNode {id_} in SubDAG {self.qualname} "
+                                f"ExecNode {id_} already has an activation (twz_active) associated with it."
+                                "This feature will be supported in the future."
+                            )
+                        values["active"] = make_active(new_id, **kwargs)
+
+                node.exec_nodes[new_id] = type(exec_node)(**values)
+
+            try:
+                if isinstance(self.return_uxns, UsageExecNode):
+                    return UsageExecNode(to_subdag_id(self.return_uxns.id), self.return_uxns.key)  # type: ignore[return-value]
+
+                if isinstance(self.return_uxns, tuple):
+                    return tuple(
+                        UsageExecNode(to_subdag_id(uxn.id), uxn.key) for uxn in self.return_uxns  # type: ignore[return-value]
+                    )
+                if isinstance(self.return_uxns, list):
+                    return [UsageExecNode(to_subdag_id(uxn.id), uxn.key) for uxn in self.return_uxns]  # type: ignore[return-value]
+
+                if isinstance(self.return_uxns, dict):
+                    return {  # type: ignore[return-value]
+                        k: UsageExecNode(to_subdag_id(uxn.id), uxn.key)
+                        for k, uxn in self.return_uxns.items()
+                    }
+                raise RuntimeError(
+                    "SubDAG must have return values as a single value, tuple, list or dict."
+                )
+            finally:
+                node.DAG_PREFIX.pop()
+
+        graph = self.graph_ids.extend_graph_with_debug_nodes(self.graph_ids, cfg)
+        _, results, _ = self.run_subgraph(graph, None, *args)
+        return get_return_values(self.return_uxns, results)  # type: ignore[return-value]
+
+
+@dataclass
+class AsyncDAG(BaseDAG[P, RVDAG]):
+    def executor(
+        self,
+        target_nodes: Optional[Sequence[Alias]] = None,
+        exclude_nodes: Optional[Sequence[Alias]] = None,
+        root_nodes: Optional[Sequence[Alias]] = None,
+        cache_deps_of: Optional[Sequence[Alias]] = None,
+        cache_in: str = "",
+        from_cache: str = "",
+    ) -> "AsyncDAGExecution[P, RVDAG]":
+        """Generates a AsyncDAGExecution for the current AsyncDAG.
 
         Args:
-            tag (Tag): tag of ExecNodes in question
+            target_nodes: the nodes to execute, excluding all nodes that can be excluded
+            exclude_nodes: the nodes to exclude from the execution
+            root_nodes: these nodes and their children will be included in the execution
+            cache_deps_of: which nodes to cache the dependencies of
+            cache_in: the path to the file where to cache
+            from_cache: the cache
 
         Returns:
-            List[ExecNode]: corresponding ExecNodes
+            the DAGExecution object associated with the dag
         """
-        if self.executed:
-            return [ex_n for ex_n in self.xn_dict.values() if ex_n.tag == tag]
-        return self.dag.get_nodes_by_tag(tag)
+        return AsyncDAGExecution(
+            dag=self,
+            target_nodes=target_nodes,
+            exclude_nodes=exclude_nodes,
+            root_nodes=root_nodes,
+            cache_deps_of=cache_deps_of,
+            cache_in=cache_in,
+            from_cache=from_cache,
+        )
 
-    def get_node_by_id(self, id_: Identifier) -> ExecNode:
-        """Get node with the given id.
+    async def setup(
+        self,
+        target_nodes: Optional[Sequence[Alias]] = None,
+        exclude_nodes: Optional[Sequence[Alias]] = None,
+        root_nodes: Optional[Sequence[Alias]] = None,
+    ) -> None:
+        """Run the setup ExecNodes for the DAG.
+
+        If target_nodes are provided, run only the necessary setup ExecNodes, otherwise will run all setup ExecNodes.
+        NOTE: `DAG` arguments should not be passed to setup ExecNodes.
+            Only pass in constants or setup `ExecNode`s results.
 
         Args:
-            id_ (Identifier): id of the ExecNode
+            target_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to use in the DAG.
+                This might include setup or non setup ExecNodes. If None is provided, will run all setup ExecNodes.
+                Defaults to None.
+            exclude_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to exclude from the DAG.
+                The user is responsible for ensuring that the overlapping between the target_nodes
+                and exclude_nodes is logical.
+            root_nodes (Optional[List[XNId]], optional): The ExecNodes that the user aims to select as ancestor nodes.
+                The user is responsible for ensuring that the overlapping between the target_nodes, the exclude_nodes
+                and the root nodes is logical.
+        """
+        graph = self._pre_setup(target_nodes, exclude_nodes, root_nodes)
+
+        # 4. execute the graph and set the results to setup_results
+        _, self.results, _ = await async_execute(
+            exec_nodes=self.exec_nodes,
+            results=self.results,
+            max_concurrency=self.max_concurrency,
+            graph=graph,
+        )
+        return
+
+    # TODO: refactor this with previous method
+    async def run_subgraph(
+        self, subgraph: DiGraphEx, results: Optional[StrictDict[Identifier, Any]], *args: P.args
+    ) -> Tuple[
+        StrictDict[Identifier, ExecNode],
+        StrictDict[Identifier, Any],
+        StrictDict[Identifier, Profile],
+    ]:
+        """Run a subgraph of the original graph (might be the same graph).
+
+        Args:
+            subgraph: the subgraph to run
+            results: the results provided from the dag (containing setup) or coming from a modified DAG (from DAGExecution)
+            *args: the args to pass to the graph
 
         Returns:
-            ExecNode: Corresponding ExecNode
+            a mapping between the execnodes and there identifiers
         """
-        # TODO: ? catch the keyError and
-        #   help the user know the id of the ExecNode by pointing to documentation!?
+        if results is None:
+            results = extend_results_with_args(self.results, self.input_uxns, *args)
+        else:
+            results = extend_results_with_args(results, self.input_uxns, *args)
+
+        exec_nodes, results, profiles = await async_execute(
+            exec_nodes=self.exec_nodes,
+            results=results,
+            max_concurrency=self.max_concurrency,
+            graph=subgraph,
+        )
+
+        # set DAG.results to the obtained value from setup ExecNodes
+        for node_id, result in results.items():
+            xn = self.exec_nodes[node_id]
+            if xn.setup and not xn.executed(self.results):
+                logger.debug(
+                    "Setting result of setup ExecNode {} to {}"
+                    "Future executions will use this result.",
+                    node_id,
+                    result,
+                )
+                self.results[node_id] = result
+
+        return exec_nodes, results, profiles
+
+    async def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RVDAG:
+        """Execute the DAG scheduler via a similar interface to the function that describes the dependencies.
+
+        Note: Currently kwargs are not supported.
+
+        Args:
+            *args (P.args): arguments to be passed to the call of the DAG
+            **kwargs (P.kwargs): keyword arguments to be passed to the call of the DAG
+
+        Returns:
+            RVDAG: return value of the DAG's execution
+
+        Raises:
+            TawaziUsageError: kwargs are passed
+        """
+        if kwargs:
+            raise TawaziUsageError(f"currently DAG does not support keyword arguments: {kwargs}")
+
+        graph = self.graph_ids.extend_graph_with_debug_nodes(self.graph_ids, cfg)
+        _, results, _ = await self.run_subgraph(graph, None, *args)
+        return get_return_values(self.return_uxns, results)  # type: ignore[return-value]
+
+
+@dataclass
+class BaseDAGExecution(Generic[P, RVDAG]):
+    """A disposable callable instance of a DAG.
+
+    It holds information about the last execution and is not threadsafe.
+
+    Args:
+        dag (DAG): The attached DAG.
+        target_nodes (Optional[List[Alias]]): The leave ExecNodes to execute.
+            If None will execute all ExecNodes.
+        exclude_nodes (Optional[List[Alias]]): The leave ExecNodes to exclude.
+            If None will exclude no ExecNode.
+        root_nodes (Optional[List[Alias]]): The base ExecNodes that will server as ancestor for the graph.
+            If None will run all ExecNodes.
+        cache_deps_of (Optional[List[Alias]]): cache all the dependencies of these nodes.
+            This option can not be used together with target_nodes nor exclude_nodes.
+        cache_in (str):
+            the path to the file where the execution should be cached.
+            The path should end in `.pkl`.
+            Will skip caching if `cache_in` is Falsy.
+        from_cache (str):
+            the path to the file where the execution should be loaded from.
+            The path should end in `.pkl`.
+            Will skip loading from cache if `from_cache` is Falsy.
+    """
+
+    dag: BaseDAG[P, RVDAG]
+    target_nodes: Optional[Sequence[Alias]] = None
+    exclude_nodes: Optional[Sequence[Alias]] = None
+    root_nodes: Optional[Sequence[Alias]] = None
+
+    # NOTE: from_cache is orthogonal to cache_in which means that if cache_in is set at the same time as from_cache.
+    #  in this case the DAG will be loaded from_cache and the results will be saved again to the cache_in file.
+    cache_deps_of: Optional[Sequence[Alias]] = None
+    cache_in: str = ""
+    from_cache: str = ""
+
+    xn_dict: Dict[Identifier, ExecNode] = field(init=False, default_factory=dict)
+    executed: bool = False
+    cached_nodes: List[ExecNode] = field(init=False, default_factory=list)
+
+    profiles: Dict[Identifier, Profile] = field(init=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Dynamic construction of attributes."""
+        # build the graph from cache if it exists
+        if self.cache_deps_of is not None:
+            if (
+                self.target_nodes is not None
+                or self.exclude_nodes is not None
+                or self.root_nodes is not None
+            ):
+                raise ValueError(
+                    "cache_deps_of can't be used together with target_nodes or exclude_nodes"
+                )
+
+            self.cache_deps_of = self.dag.get_multiple_nodes_aliases(self.cache_deps_of)
+            graph = self.dag.graph_ids.make_subgraph(target_nodes=self.cache_deps_of)
+            self.cached_nodes = list(graph.nodes)
+        else:
+            # clean user input
+            if self.target_nodes is not None:
+                self.target_nodes = self.dag.get_multiple_nodes_aliases(self.target_nodes)
+
+            if self.exclude_nodes is not None:
+                self.exclude_nodes = self.dag.get_multiple_nodes_aliases(self.exclude_nodes)
+
+            if self.root_nodes is not None:
+                self.root_nodes = self.dag.get_multiple_nodes_aliases(self.root_nodes)
+
+            graph = self.dag.graph_ids.make_subgraph(
+                target_nodes=self.target_nodes,
+                exclude_nodes=self.exclude_nodes,
+                root_nodes=self.root_nodes,
+            )
+
+        # add debug nodes
+        self.graph = graph.extend_graph_with_debug_nodes(self.dag.graph_ids, cfg)
+
+    @property
+    def results(self) -> StrictDict[Identifier, Any]:
+        """Returns the results of the previous DAGExecution.
+
+        Before the DAG is executed, the results are the same as the underlying DAG. This also includes before/after setup.
+        After Execution, the results have been enriched with all the ExecNodes' results.
+        """
         if self.executed:
-            return self.xn_dict[id_]
-        return self.dag.get_node_by_id(id_)
+            return self._results
+        return self.dag.results
+
+    @results.setter
+    def results(self, value: StrictDict[Identifier, Any]) -> None:
+        """Set results."""
+        self._results = value
+
+    def _cache_results(self, results: Dict[Identifier, Any]) -> None:
+        """Cache execution results.
+
+        We are currently only storing the results of the execution,
+        so the configuration of the ExecNodes is lost
+        But this it should not change between executions.
+        """
+        Path(self.cache_in).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.cache_in, "wb") as f:
+            if self.cache_deps_of is not None:
+                non_cacheable_ids: Set[Identifier] = set()
+                for aliases in self.cache_deps_of:
+                    ids = self.dag.alias_to_ids(aliases)
+                    non_cacheable_ids = non_cacheable_ids.union(ids)
+
+                to_cache_results = {
+                    id_: res for id_, res in results.items() if id_ not in non_cacheable_ids
+                }
+            else:
+                to_cache_results = results
+            pickle.dump(to_cache_results, f, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False)
+
+    def _pre_call(self) -> None:
+        if self.executed:
+            raise TawaziUsageError("DAGExecution object has already been executed.")
+
+        if self.from_cache:
+            with open(self.from_cache, "rb") as f:
+                cached_results = pickle.load(f)  # noqa: S301
+            for node in self.cached_nodes:
+                self.results = cached_results[node.id]
+
+    def _post_call(self) -> RVDAG:
+        # mark as executed. Important for the next step
+        self.executed = True
+
+        # 3. cache in the graph results
+        if self.cache_in:
+            self._cache_results(self.results)
+
+        # 3. extract the returned value/values
+        return get_return_values(self.dag.return_uxns, self.results)  # type: ignore[return-value]
+
+
+@dataclass
+class DAGExecution(BaseDAGExecution[P, RVDAG]):
+    """Sync implementation of BaseDAGExecution."""
+
+    dag: DAG[P, RVDAG]
 
     def setup(self) -> None:
-        """Does the same thing as DAG.setup. However the `target_nodes` and `exclude_nodes` are taken from the DAGExecution's initization."""
+        """Same thing as DAG.setup but `target_nodes` and `exclude_nodes` come from the DAGExecution's init."""
         # TODO: handle the case where cache_deps_of is provided instead of target_nodes and exclude_nodes
         #  in which case the deps_of might have a setup node themselves which should not run.
         #  This is an edge case though that is not important to handle at the current moment.
@@ -1027,61 +1103,46 @@ class DAGExecution(Generic[P, RVDAG]):
         Returns:
             RVDAG: the return value of the DAG's Execution
         """
-        if self.executed:
-            warnings.warn("DAGExecution object's reuse is not recommended.", stacklevel=2)
-            self._construct_dynamic_attributes()
-
-        # NOTE: *args will be ignored if self.from_cache is set!
-        dag = self.dag
-
-        # maybe call_id will be changed to Union[int, str].
-        # Keep call_id as Optional[str] for now
-        call_id = self.call_id if self.call_id is not None else ""
-
-        # 1. copy the ExecNodes
-        call_xn_dict = dag._make_call_xn_dict(*args)
-        if self.from_cache:
-            with open(self.from_cache, "rb") as f:
-                cached_results = pickle.load(f)  # noqa: S301
-            # set the result for the ExecNode that were previously executed
-            # this will make them skip execution inside the scheduler
-            for id_, result in cached_results.items():
-                call_xn_dict[id_].result = result
+        self._pre_call()
 
         # 2. Execute the scheduler
-        self.xn_dict = dag._execute(self.graph, call_xn_dict, call_id)
-        self.results = {xn.id: xn.result for xn in self.xn_dict.values()}
+        self.xn_dict, self.results, self.profiles = self.dag.run_subgraph(
+            self.graph, self.results, *args
+        )
 
-        # 3. cache in the graph results
-        if self.cache_in:
-            Path(self.cache_in).parent.mkdir(parents=True, exist_ok=True)
-            with open(self.cache_in, "wb") as f:
-                # NOTE: we are currently only storing the results of the execution,
-                #  this means that the configuration of the ExecNodes are lost!
-                #  But this is ok since it should not change between executions!
-                #  for example, a setup ExecNode should stay a setup ExecNode between caching in the results and reading back the cached results
-                #  the same goes for the DAG itself, the behavior when an error is encountered & its concurrency will be controlled via the constructor
+        return self._post_call()
 
-                if self.cache_deps_of is not None:
-                    non_cacheable_ids: Set[Identifier] = set()
-                    for aliases in self.cache_deps_of:
-                        ids = self.dag._alias_to_ids(aliases)
-                        non_cacheable_ids = non_cacheable_ids.union(ids)
 
-                    to_cache_results = {
-                        id_: res
-                        for id_, res in self.results.items()
-                        if id_ not in non_cacheable_ids
-                    }
-                else:
-                    to_cache_results = self.results
-                pickle.dump(
-                    to_cache_results, f, protocol=pickle.HIGHEST_PROTOCOL, fix_imports=False
-                )
+class AsyncDAGExecution(BaseDAGExecution[P, RVDAG]):
+    """Async implementation of BaseDAGExecution."""
 
-        # TODO: make DAGExecution reusable but do not guarantee ThreadSafety!
-        self.executed = True
-        # 3. extract the returned value/values
-        return dag._get_return_values(self.xn_dict)  # type: ignore[return-value]
+    dag: AsyncDAG[P, RVDAG]
 
-    # TODO: add execution order (the order in which the nodes were executed)
+    async def setup(self) -> None:
+        """Same thing as DAG.setup but `target_nodes` and `exclude_nodes` come from the DAGExecution's init."""
+        # TODO: handle the case where cache_deps_of is provided instead of target_nodes and exclude_nodes
+        #  in which case the deps_of might have a setup node themselves which should not run.
+        #  This is an edge case though that is not important to handle at the current moment.
+        await self.dag.setup(target_nodes=self.target_nodes, exclude_nodes=self.exclude_nodes)
+
+    async def __call__(self, *args: P.args, **kwargs: P.kwargs) -> RVDAG:
+        """Call the DAG.
+
+        Args:
+            *args: positional arguments to pass in to the DAG
+            **kwargs: keyword arguments to pass in to the DAG
+
+        Raises:
+            TawaziUsageError: if the DAGExecution has already been executed.
+
+        Returns:
+            RVDAG: the return value of the DAG's Execution
+        """
+        self._pre_call()
+
+        # 2. Execute the scheduler
+        self.xn_dict, self.results, self.profiles = await self.dag.run_subgraph(
+            self.graph, self.results, *args
+        )
+
+        return self._post_call()
